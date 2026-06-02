@@ -186,23 +186,44 @@ export async function POST(request: Request) {
 }
 
 async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
-  if (!body.entry) return
+
+  console.log("================================")
+  console.log("🔥 WEBHOOK BODY RECEIVED")
+  console.log(JSON.stringify(body, null, 2))
+  console.log("================================")
+
+  if (!body.entry) {
+    console.log("❌ No entry found in webhook payload")
+    return
+  }
 
   for (const entry of body.entry) {
+    console.log("📦 Processing Entry")
+
     for (const change of entry.changes) {
+      console.log("🔄 Processing Change")
+
       const value = change.value
 
       // Handle status updates
       if (value.statuses) {
+        console.log("📊 Status update received")
+
         for (const status of value.statuses) {
+          console.log("Status:", status)
           await handleStatusUpdate(status)
         }
       }
 
       // Handle incoming messages
-      if (!value.messages || !value.contacts) continue
+      if (!value.messages || !value.contacts) {
+        console.log("⚠️ No messages or contacts found")
+        continue
+      }
 
       const phoneNumberId = value.metadata.phone_number_id
+
+      console.log("📱 PHONE NUMBER ID:", phoneNumberId)
 
       // Find user's config by phone_number_id
       const { data: config, error: configError } = await supabaseAdmin()
@@ -211,26 +232,48 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         .eq('phone_number_id', phoneNumberId)
         .single()
 
+      console.log("🔍 CONFIG FOUND:", !!config)
+
       if (configError || !config) {
-        console.error('No config found for phone_number_id:', phoneNumberId)
+        console.error("❌ CONFIG NOT FOUND")
+        console.error("PHONE NUMBER ID:", phoneNumberId)
+        console.error(configError)
         continue
       }
 
+      console.log("✅ CONFIG FOUND FOR USER:", config.user_id)
+
       const decryptedAccessToken = decrypt(config.access_token)
+
+      console.log("🔑 ACCESS TOKEN DECRYPTED")
 
       for (let i = 0; i < value.messages.length; i++) {
         const message = value.messages[i]
         const contact = value.contacts[i] || value.contacts[0]
 
-        await processMessage(
-          message,
-          contact,
-          config.user_id,
-          decryptedAccessToken
-        )
+        console.log("📩 NEW MESSAGE RECEIVED")
+        console.log("Message Type:", message.type)
+        console.log("Message ID:", message.id)
+        console.log("From:", message.from)
+
+        try {
+          await processMessage(
+            message,
+            contact,
+            config.user_id,
+            decryptedAccessToken
+          )
+
+          console.log("✅ MESSAGE PROCESSED SUCCESSFULLY")
+        } catch (err) {
+          console.error("❌ PROCESS MESSAGE FAILED")
+          console.error(err)
+        }
       }
     }
   }
+
+  console.log("🏁 WEBHOOK PROCESSING FINISHED")
 }
 
 // The happy-path status ladder — pending → sent → delivered → read →
