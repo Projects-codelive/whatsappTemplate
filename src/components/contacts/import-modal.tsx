@@ -69,7 +69,7 @@ function parseCSV(text: string): ParsedRow[] {
 
     const rawTags = tagsIdx >= 0 ? values[tagsIdx]?.replace(/["']/g, '').trim() : '';
     const tags = rawTags
-      ? rawTags.split(';').map((t) => t.trim()).filter(Boolean)
+      ? rawTags.split(/[;,]/).map((t) => t.trim()).filter(Boolean)
       : undefined;
 
     rows.push({
