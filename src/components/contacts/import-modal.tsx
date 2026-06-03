@@ -229,8 +229,8 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="bg-slate-900 border-slate-700 text-slate-200 sm:max-w-lg">
-        <DialogHeader>
+      <DialogContent className="bg-slate-900 border-slate-700 text-slate-200 sm:max-w-lg flex flex-col max-h-[90vh] overflow-hidden">
+        <DialogHeader className='shrink-0'>
           <DialogTitle className="text-white">Import Contacts</DialogTitle>
           <DialogDescription className="text-slate-400">
             Upload a CSV file with a &quot;phone&quot; column (required). Optional columns:
@@ -238,7 +238,7 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        <div className="space-y-4 overflow-y-auto flex-1 py-2 pr-1">
           {/* Upload area */}
           <div
             onClick={() => fileInputRef.current?.click()}
@@ -331,7 +331,7 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
           )}
         </div>
 
-        <DialogFooter className="bg-slate-900 border-slate-700">
+        <DialogFooter className="shrink-0 bg-slate-900 border-slate-700 pt-3">
           <Button
             type="button"
             variant="outline"
