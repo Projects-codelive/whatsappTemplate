@@ -225,7 +225,7 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
     }
   }
 
-  const preview = parsedRows.slice(0, 5);
+  const preview = parsedRows.slice(0, 3);
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -301,9 +301,9 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
                   </tbody>
                 </table>
               </div>
-              {parsedRows.length > 5 && (
+              {parsedRows.length > 3 && (
                 <p className="text-xs text-slate-500">
-                  ...and {parsedRows.length - 5} more rows
+                  ...and {parsedRows.length - 3} more rows
                 </p>
               )}
             </div>
@@ -331,7 +331,7 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
           )}
         </div>
 
-        <DialogFooter className="shrink-0 bg-slate-900 border-slate-700 pt-3">
+        <DialogFooter className="shrink-0 bg-slate-900 border-t border-slate-700 pt-3">
           <Button
             type="button"
             variant="outline"
