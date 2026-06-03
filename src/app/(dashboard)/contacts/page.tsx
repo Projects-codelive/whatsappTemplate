@@ -70,6 +70,8 @@ export default function ContactsPage() {
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Contact | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [deleteAllConfirmOpen, setDeleteAllConfirmOpen] = useState(false);
+  const [deletingAll, setDeletingAll] = useState(false);
 
   // All tags for display
   const [tagsMap, setTagsMap] = useState<Record<string, Tag>>({});
@@ -201,6 +203,36 @@ export default function ContactsPage() {
     setDeleteTarget(null);
   }
 
+  async function handleDeleteAll() {
+    setDeletingAll(true);
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    const user = session?.user;
+    if (!user) {
+      toast.error('Not authenticated');
+      setDeletingAll(false);
+      return;
+    }
+
+    const { error } = await supabase
+      .from('contacts')
+      .delete()
+      .eq('user_id', user.id);
+
+    if (error) {
+      toast.error('Failed to delete all contacts');
+    } else {
+      toast.success('All contacts deleted');
+      fetchContacts();
+    }
+    setDeletingAll(false);
+    setDeleteAllConfirmOpen(false);
+  }
+
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
+
+
   const totalPages = Math.ceil(totalCount / PAGE_SIZE);
   const hasNext = page < totalPages - 1;
   const hasPrev = page > 0;
@@ -216,6 +248,17 @@ export default function ContactsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+
+
+         <Button
+            variant="outline"
+            onClick={() => setDeleteAllConfirmOpen(true)}
+            className="border-red-800 text-red-400 hover:bg-red-950 hover:text-red-300"
+          >
+            <Trash2 className="size-4" />
+            Delete All
+          </Button>
+
           <Button
             variant="outline"
             onClick={() => setImportOpen(true)}
@@ -457,33 +500,35 @@ export default function ContactsPage() {
       />
 
       {/* Delete Confirmation */}
-      <Dialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+      
+        
+
+      {/* Delete All Confirmation */}
+      <Dialog open={deleteAllConfirmOpen} onOpenChange={setDeleteAllConfirmOpen}>
         <DialogContent className="bg-slate-900 border-slate-700 text-slate-200 sm:max-w-sm">
           <DialogHeader>
-            <DialogTitle className="text-white">Delete Contact</DialogTitle>
+            <DialogTitle className="text-white">Delete All Contacts</DialogTitle>
             <DialogDescription className="text-slate-400">
               Are you sure you want to delete{' '}
-              <span className="text-slate-200 font-medium">
-                {deleteTarget?.name || deleteTarget?.phone}
-              </span>
-              ? This action cannot be undone.
+              <span className="text-red-400 font-medium">all {totalCount} contacts</span>?
+              This action cannot be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="bg-slate-900 border-slate-700">
             <Button
               variant="outline"
-              onClick={() => setDeleteConfirmOpen(false)}
+              onClick={() => setDeleteAllConfirmOpen(false)}
               className="border-slate-700 text-slate-300 hover:bg-slate-800"
             >
               Cancel
             </Button>
             <Button
               variant="destructive"
-              onClick={handleDelete}
-              disabled={deleting}
+              onClick={handleDeleteAll}
+              disabled={deletingAll}
             >
-              {deleting && <Loader2 className="size-4 animate-spin" />}
-              Delete
+              {deletingAll && <Loader2 className="size-4 animate-spin" />}
+              Delete All
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -491,3 +536,7 @@ export default function ContactsPage() {
     </div>
   );
 }
+
+   
+  
+
