@@ -230,7 +230,7 @@ export default function ContactsPage() {
     setDeleteAllConfirmOpen(false);
   }
 
-  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
+  
 
 
   const totalPages = Math.ceil(totalCount / PAGE_SIZE);
