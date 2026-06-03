@@ -66,20 +66,19 @@ function parseCSV(text: string): ParsedRow[] {
 
     const phone = values[phoneIdx]?.replace(/["']/g, '').trim();
     if (!phone) continue;
-    const rawTags =
-  tagsIdx >= 0 ? values[tagsIdx]?.replace(/["']/g, '').trim() : '';
-const tags = rawTags
-  ? rawTags.split(';').map((t) => t.trim()).filter(Boolean) // ← splits "VIP;Lead" into ["VIP","Lead"]
-  : undefined;
+
+    const rawTags = tagsIdx >= 0 ? values[tagsIdx]?.replace(/["']/g, '').trim() : '';
+    const tags = rawTags
+      ? rawTags.split(';').map((t) => t.trim()).filter(Boolean)
+      : undefined;
 
     rows.push({
-  phone,
-  name: nameIdx >= 0 ? values[nameIdx]?.replace(/["']/g, '').trim() || undefined : undefined,
-  email: emailIdx >= 0 ? values[emailIdx]?.replace(/["']/g, '').trim() || undefined : undefined,
-  company:
-    companyIdx >= 0 ? values[companyIdx]?.replace(/["']/g, '').trim() || undefined : undefined,
-  tags, // ← add this
-});
+      phone,
+      name: nameIdx >= 0 ? values[nameIdx]?.replace(/["']/g, '').trim() || undefined : undefined,
+      email: emailIdx >= 0 ? values[emailIdx]?.replace(/["']/g, '').trim() || undefined : undefined,
+      company: companyIdx >= 0 ? values[companyIdx]?.replace(/["']/g, '').trim() || undefined : undefined,
+      tags,
+    });
   }
 
   return rows;
@@ -101,9 +100,9 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
-  function handleOpenChange(open: boolean) {
-    if (!open) reset();
-    onOpenChange(open);
+  function handleOpenChange(isOpen: boolean) {
+    if (!isOpen) reset();
+    onOpenChange(isOpen);
   }
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -126,35 +125,35 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
   }
 
   async function linkTags(contactId: string, tagNames: string[], userId: string) {
-  if (!tagNames.length) return;
+    if (!tagNames.length) return;
 
-  for (const tagName of tagNames) {
-    // 1. Check if tag exists for this user
-    let { data: existingTag } = await supabase
-      .from('tags')
-      .select('id')
-      .eq('user_id', userId)
-      .eq('name', tagName)
-      .single();
-
-    // 2. Create tag if it doesn't exist
-    if (!existingTag) {
-      const { data: newTag } = await supabase
+    for (const tagName of tagNames) {
+      // 1. Check if tag exists for this user
+      let { data: existingTag } = await supabase
         .from('tags')
-        .insert({ user_id: userId, name: tagName, color: '#6366f1' })
         .select('id')
+        .eq('user_id', userId)
+        .eq('name', tagName)
         .single();
-      existingTag = newTag;
+
+      // 2. Create tag if it doesn't exist
+      if (!existingTag) {
+        const { data: newTag } = await supabase
+          .from('tags')
+          .insert({ user_id: userId, name: tagName, color: '#6366f1' })
+          .select('id')
+          .single();
+        existingTag = newTag;
+      }
+
+      if (!existingTag) continue;
+
+      // 3. Link contact to tag
+      await supabase
+        .from('contact_tags')
+        .insert({ contact_id: contactId, tag_id: existingTag.id });
     }
-
-    if (!existingTag) continue;
-
-    // 3. Link contact to tag
-    await supabase
-      .from('contact_tags')
-      .insert({ contact_id: contactId, tag_id: existingTag.id });
   }
-}
 
   async function handleImport() {
     if (parsedRows.length === 0) return;
@@ -183,31 +182,32 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
         }));
 
         const { data, error } = await supabase
-  .from('contacts')
-  .insert(rows)
-  .select('id');
+          .from('contacts')
+          .insert(rows)
+          .select('id');
 
-if (error) {
-  // Try individual inserts for this chunk
-  for (let j = 0; j < chunk.length; j++) {
-    const { data: single, error: singleErr } = await supabase
-      .from('contacts')
-      .insert(rows[j])
-      .select('id')
-      .single();
-    if (singleErr) {
-      failed++;
-    } else {
-      imported++;
-      await linkTags(single.id, chunk[j].tags ?? [], user.id);
-    }
-  }
-} else {
-  imported += data?.length ?? chunk.length;
-  for (let j = 0; j < (data?.length ?? 0); j++) {
-    await linkTags(data[j].id, chunk[j].tags ?? [], user.id);
-  }
-}
+        if (error) {
+          // Try individual inserts for this chunk
+          for (let j = 0; j < chunk.length; j++) {
+            const { data: single, error: singleErr } = await supabase
+              .from('contacts')
+              .insert(rows[j])
+              .select('id')
+              .single();
+            if (singleErr) {
+              failed++;
+            } else {
+              imported++;
+              await linkTags(single.id, chunk[j].tags ?? [], user.id);
+            }
+          }
+        } else {
+          imported += data?.length ?? chunk.length;
+          for (let j = 0; j < (data?.length ?? 0); j++) {
+            await linkTags(data[j].id, chunk[j].tags ?? [], user.id);
+          }
+        }
+      } // ← chunk loop ends here
 
       setResult({ imported, failed });
       if (imported > 0) {
@@ -233,8 +233,8 @@ if (error) {
         <DialogHeader>
           <DialogTitle className="text-white">Import Contacts</DialogTitle>
           <DialogDescription className="text-slate-400">
-           Upload a CSV file with a &quot;phone&quot; column (required). Optional columns:
-name, email, company, tags. Separate multiple tags with a semicolon (e.g. VIP;Lead).
+            Upload a CSV file with a &quot;phone&quot; column (required). Optional columns:
+            name, email, company, tags. Separate multiple tags with a semicolon (e.g. VIP;Lead).
           </DialogDescription>
         </DialogHeader>
 
@@ -255,9 +255,7 @@ name, email, company, tags. Separate multiple tags with a semicolon (e.g. VIP;Le
             ) : (
               <>
                 <Upload className="size-8 text-slate-500" />
-                <p className="text-sm text-slate-400">
-                  Click to upload CSV file
-                </p>
+                <p className="text-sm text-slate-400">Click to upload CSV file</p>
                 <p className="text-xs text-slate-500">
                   CSV with &quot;phone&quot; column required
                 </p>
