@@ -67,21 +67,29 @@ export default function ContactsPage() {
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailContactId, setDetailContactId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+
+  // Delete single contact
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Contact | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [deleteAllConfirmOpen, setDeleteAllConfirmOpen] = useState(false);
-  const [deletingAll, setDeletingAll] = useState(false);
 
-  // All tags for display
+  // Smart delete dialog
+  const [smartDeleteOpen, setSmartDeleteOpen] = useState(false);
+  const [selectedDeleteTagId, setSelectedDeleteTagId] = useState<string | null>(null);
+  const [deletingAll, setDeletingAll] = useState(false);
+  const [deletingByTag, setDeletingByTag] = useState(false);
+
+  // All tags for display & smart delete
   const [tagsMap, setTagsMap] = useState<Record<string, Tag>>({});
+  const [allTags, setAllTags] = useState<Tag[]>([]);
 
   const fetchTags = useCallback(async () => {
-    const { data } = await supabase.from('tags').select('*');
+    const { data } = await supabase.from('tags').select('*').order('name');
     if (data) {
       const map: Record<string, Tag> = {};
       data.forEach((t) => (map[t.id] = t));
       setTagsMap(map);
+      setAllTags(data);
     }
   }, [supabase]);
 
@@ -118,7 +126,6 @@ export default function ContactsPage() {
       return;
     }
 
-    // Fetch tags for these contacts
     const contactIds = data.map((c) => c.id);
     const { data: contactTags } = await supabase
       .from('contact_tags')
@@ -142,10 +149,6 @@ export default function ContactsPage() {
     setLoading(false);
   }, [supabase, page, search, tagsMap]);
 
-  // Load-once-on-mount-ish data fetches. Each setter inside runs
-  // inside an async promise completion (Supabase await), not
-  // synchronously in the effect body, so the cascade the lint rule
-  // warns about doesn't apply here.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchTags();
@@ -203,11 +206,11 @@ export default function ContactsPage() {
     setDeleteTarget(null);
   }
 
+  // Delete ALL contacts for this user
   async function handleDeleteAll() {
     setDeletingAll(true);
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
+
+    const { data: { session } } = await supabase.auth.getSession();
     const user = session?.user;
     if (!user) {
       toast.error('Not authenticated');
@@ -224,18 +227,59 @@ export default function ContactsPage() {
       toast.error('Failed to delete all contacts');
     } else {
       toast.success('All contacts deleted');
+      setPage(0);
       fetchContacts();
     }
+
     setDeletingAll(false);
-    setDeleteAllConfirmOpen(false);
+    setSmartDeleteOpen(false);
+    setSelectedDeleteTagId(null);
   }
 
-  
+  // Delete contacts by selected tag
+  async function handleDeleteByTag() {
+    if (!selectedDeleteTagId) return;
+    setDeletingByTag(true);
 
+    // 1. Get all contact_ids linked to this tag
+    const { data: tagLinks, error: tagLinksError } = await supabase
+      .from('contact_tags')
+      .select('contact_id')
+      .eq('tag_id', selectedDeleteTagId);
+
+    if (tagLinksError || !tagLinks || tagLinks.length === 0) {
+      toast.error(tagLinksError ? 'Failed to fetch contacts for tag' : 'No contacts found for this tag');
+      setDeletingByTag(false);
+      return;
+    }
+
+    const contactIds = tagLinks.map((r) => r.contact_id);
+
+    // 2. Delete those contacts
+    const { error } = await supabase
+      .from('contacts')
+      .delete()
+      .in('id', contactIds);
+
+    if (error) {
+      toast.error('Failed to delete contacts for this tag');
+    } else {
+      const tagName = tagsMap[selectedDeleteTagId]?.name ?? 'tag';
+      toast.success(`All contacts with tag "${tagName}" deleted`);
+      setPage(0);
+      fetchContacts();
+    }
+
+    setDeletingByTag(false);
+    setSmartDeleteOpen(false);
+    setSelectedDeleteTagId(null);
+  }
 
   const totalPages = Math.ceil(totalCount / PAGE_SIZE);
   const hasNext = page < totalPages - 1;
   const hasPrev = page > 0;
+
+  const isDeleting = deletingAll || deletingByTag;
 
   return (
     <div className="space-y-6">
@@ -248,15 +292,18 @@ export default function ContactsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-
-
-         <Button
+          {/* Smart Delete Button */}
+          <Button
             variant="outline"
-            onClick={() => setDeleteAllConfirmOpen(true)}
-            className="border-red-800 text-red-400 hover:bg-red-950 hover:text-red-300"
+            onClick={() => {
+              setSelectedDeleteTagId(null);
+              setSmartDeleteOpen(true);
+            }}
+            disabled={totalCount === 0}
+            className="border-red-800 text-red-400 hover:bg-red-950 hover:text-red-300 disabled:opacity-30"
           >
             <Trash2 className="size-4" />
-            Delete All
+            Delete
           </Button>
 
           <Button
@@ -284,8 +331,6 @@ export default function ContactsPage() {
           value={search}
           onChange={(e) => {
             setSearch(e.target.value);
-            // Reset pagination when the query changes — the result
-            // set shrinks/grows, page N may no longer be valid.
             setPage(0);
           }}
           placeholder="Search by name, phone, or email..."
@@ -499,44 +544,160 @@ export default function ContactsPage() {
         onImported={fetchContacts}
       />
 
-      {/* Delete Confirmation */}
-      
-        
-
-      {/* Delete All Confirmation */}
-      <Dialog open={deleteAllConfirmOpen} onOpenChange={setDeleteAllConfirmOpen}>
+      {/* Delete Single Contact Confirmation */}
+      <Dialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
         <DialogContent className="bg-slate-900 border-slate-700 text-slate-200 sm:max-w-sm">
           <DialogHeader>
-            <DialogTitle className="text-white">Delete All Contacts</DialogTitle>
+            <DialogTitle className="text-white">Delete Contact</DialogTitle>
             <DialogDescription className="text-slate-400">
               Are you sure you want to delete{' '}
-              <span className="text-red-400 font-medium">all {totalCount} contacts</span>?
-              This action cannot be undone.
+              <span className="text-slate-200 font-medium">
+                {deleteTarget?.name || deleteTarget?.phone}
+              </span>
+              ? This action cannot be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="bg-slate-900 border-slate-700">
             <Button
               variant="outline"
-              onClick={() => setDeleteAllConfirmOpen(false)}
+              onClick={() => setDeleteConfirmOpen(false)}
               className="border-slate-700 text-slate-300 hover:bg-slate-800"
             >
               Cancel
             </Button>
             <Button
               variant="destructive"
-              onClick={handleDeleteAll}
-              disabled={deletingAll}
+              onClick={handleDelete}
+              disabled={deleting}
             >
-              {deletingAll && <Loader2 className="size-4 animate-spin" />}
-              Delete All
+              {deleting && <Loader2 className="size-4 animate-spin" />}
+              Delete
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Smart Delete Dialog */}
+      <Dialog
+        open={smartDeleteOpen}
+        onOpenChange={(o) => {
+          if (!o) setSelectedDeleteTagId(null);
+          setSmartDeleteOpen(o);
+        }}
+      >
+        <DialogContent className="bg-slate-900 border-slate-700 text-slate-200 sm:max-w-md flex flex-col max-h-[90vh] overflow-hidden">
+          <DialogHeader className="shrink-0">
+            <DialogTitle className="text-white">Delete Contacts</DialogTitle>
+            <DialogDescription className="text-slate-400">
+              Delete all contacts at once, or select a tag to delete only contacts assigned to that tag.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex-1 overflow-y-auto py-3 space-y-4">
+
+            {/* Delete All option */}
+            <div
+              onClick={() => !isDeleting && setSelectedDeleteTagId(null)}
+              className={`rounded-lg border p-3 cursor-pointer transition-all ${
+                selectedDeleteTagId === null
+                  ? 'border-red-600 bg-red-950/40'
+                  : 'border-slate-700 hover:border-slate-600'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <div
+                  className={`size-3.5 rounded-full border-2 shrink-0 ${
+                    selectedDeleteTagId === null
+                      ? 'border-red-500 bg-red-500'
+                      : 'border-slate-500'
+                  }`}
+                />
+                <div>
+                  <p className="text-sm font-medium text-white">Delete All Contacts</p>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Permanently removes all {totalCount} contacts
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Divider */}
+            <div className="flex items-center gap-2">
+              <div className="flex-1 h-px bg-slate-700" />
+              <span className="text-xs text-slate-500">or delete by tag</span>
+              <div className="flex-1 h-px bg-slate-700" />
+            </div>
+
+            {/* Tag list */}
+            {allTags.length === 0 ? (
+              <p className="text-xs text-slate-500 text-center py-4">
+                No tags available.
+              </p>
+            ) : (
+              <div className="space-y-1.5">
+                {allTags.map((tag) => (
+                  <div
+                    key={tag.id}
+                    onClick={() => !isDeleting && setSelectedDeleteTagId(tag.id)}
+                    className={`rounded-lg border p-3 cursor-pointer transition-all ${
+                      selectedDeleteTagId === tag.id
+                        ? 'border-red-600 bg-red-950/40'
+                        : 'border-slate-700 hover:border-slate-600'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <div
+                        className={`size-3.5 rounded-full border-2 shrink-0 ${
+                          selectedDeleteTagId === tag.id
+                            ? 'border-red-500 bg-red-500'
+                            : 'border-slate-500'
+                        }`}
+                      />
+                      <span
+                        className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+                        style={{
+                          backgroundColor: tag.color + '20',
+                          color: tag.color,
+                        }}
+                      >
+                        {tag.name}
+                      </span>
+                      <span className="text-xs text-slate-500 ml-auto">
+                        Delete all contacts with this tag
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter className="shrink-0 border-t border-slate-700 pt-3 bg-slate-900">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setSelectedDeleteTagId(null);
+                setSmartDeleteOpen(false);
+              }}
+              disabled={isDeleting}
+              className="border-slate-700 text-slate-300 hover:bg-slate-800"
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={isDeleting}
+              onClick={selectedDeleteTagId === null ? handleDeleteAll : handleDeleteByTag}
+            >
+              {isDeleting && <Loader2 className="size-4 animate-spin" />}
+              {selectedDeleteTagId === null
+                ? `Delete All ${totalCount} Contacts`
+                : `Delete Contacts with "${tagsMap[selectedDeleteTagId]?.name}"`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
     </div>
   );
 }
-
-   
-  
-
