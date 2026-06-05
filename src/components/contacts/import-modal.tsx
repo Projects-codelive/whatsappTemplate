@@ -48,7 +48,6 @@ function parseCSV(text: string): ParsedRow[] {
     const line = lines[i].trim();
     if (!line) continue;
 
-    // Simple CSV parse (handles quoted fields)
     const values: string[] = [];
     let current = '';
     let inQuotes = false;
@@ -91,12 +90,16 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
   const [file, setFile] = useState<File | null>(null);
   const [parsedRows, setParsedRows] = useState<ParsedRow[]>([]);
   const [importing, setImporting] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [progressLabel, setProgressLabel] = useState('');
   const [result, setResult] = useState<{ imported: number; failed: number } | null>(null);
 
   function reset() {
     setFile(null);
     setParsedRows([]);
     setResult(null);
+    setProgress(0);
+    setProgressLabel('');
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
@@ -108,69 +111,70 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const selected = e.target.files?.[0];
     if (!selected) return;
-
     setFile(selected);
     setResult(null);
-
     const text = await selected.text();
     const rows = parseCSV(text);
-
     if (rows.length === 0) {
       toast.error('No valid rows found. Ensure CSV has a "phone" column header.');
       setParsedRows([]);
       return;
     }
-
     setParsedRows(rows);
-  }
-
-  async function linkTags(contactId: string, tagNames: string[], userId: string) {
-    if (!tagNames.length) return;
-
-    for (const tagName of tagNames) {
-      // 1. Check if tag exists for this user
-      let { data: existingTag } = await supabase
-        .from('tags')
-        .select('id')
-        .eq('user_id', userId)
-        .eq('name', tagName)
-        .single();
-
-      // 2. Create tag if it doesn't exist
-      if (!existingTag) {
-        const { data: newTag } = await supabase
-          .from('tags')
-          .insert({ user_id: userId, name: tagName, color: '#6366f1' })
-          .select('id')
-          .single();
-        existingTag = newTag;
-      }
-
-      if (!existingTag) continue;
-
-      // 3. Link contact to tag
-      await supabase
-        .from('contact_tags')
-        .insert({ contact_id: contactId, tag_id: existingTag.id });
-    }
   }
 
   async function handleImport() {
     if (parsedRows.length === 0) return;
     setImporting(true);
+    setProgress(0);
+    setProgressLabel('Preparing tags...');
 
     try {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
+      const { data: { session } } = await supabase.auth.getSession();
       const user = session?.user;
       if (!user) throw new Error('Not authenticated');
 
+      // ── STEP 1: Collect ALL unique tag names from entire CSV (1 pass, no API calls) ──
+      const allTagNames = Array.from(
+        new Set(parsedRows.flatMap((r) => r.tags ?? []).filter(Boolean))
+      );
+
+      // tagNameToId will hold name → uuid for every tag we need
+      const tagNameToId: Record<string, string> = {};
+
+      if (allTagNames.length > 0) {
+        // ── STEP 2: Fetch ALL existing tags in ONE single API call ──
+        const { data: existingTags } = await supabase
+          .from('tags')
+          .select('id, name')
+          .eq('user_id', user.id)
+          .in('name', allTagNames);
+
+        existingTags?.forEach((t) => { tagNameToId[t.name] = t.id; });
+
+        // ── STEP 3: Create ONLY missing tags in ONE batch insert ──
+        const missingNames = allTagNames.filter((n) => !tagNameToId[n]);
+        if (missingNames.length > 0) {
+          const { data: newTags } = await supabase
+            .from('tags')
+            .insert(missingNames.map((name) => ({ user_id: user.id, name, color: '#6366f1' })))
+            .select('id, name');
+          newTags?.forEach((t) => { tagNameToId[t.name] = t.id; });
+        }
+      }
+
+      setProgress(5);
+      setProgressLabel('Importing contacts...');
+
+      // ── STEP 4: Insert contacts in chunks of 1000 ──
       let imported = 0;
       let failed = 0;
+      const chunkSize = 1000;
 
-      // Batch insert in chunks of 50
-      const chunkSize = 50;
+      // We need to track which inserted contact ID maps to which CSV row
+      // so we can build contact_tags later
+      const insertedMap: { contactId: string; rowIndex: number }[] = [];
+
       for (let i = 0; i < parsedRows.length; i += chunkSize) {
         const chunk = parsedRows.slice(i, i + chunkSize);
         const rows = chunk.map((row) => ({
@@ -187,7 +191,7 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
           .select('id');
 
         if (error) {
-          // Try individual inserts for this chunk
+          // Chunk failed — try row by row as fallback
           for (let j = 0; j < chunk.length; j++) {
             const { data: single, error: singleErr } = await supabase
               .from('contacts')
@@ -198,24 +202,55 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
               failed++;
             } else {
               imported++;
-              await linkTags(single.id, chunk[j].tags ?? [], user.id);
+              insertedMap.push({ contactId: single.id, rowIndex: i + j });
             }
           }
         } else {
-          imported += data?.length ?? chunk.length;
-          for (let j = 0; j < (data?.length ?? 0); j++) {
-            await linkTags(data[j].id, chunk[j].tags ?? [], user.id);
-          }
+          imported += data?.length ?? 0;
+          data?.forEach((d, j) => {
+            insertedMap.push({ contactId: d.id, rowIndex: i + j });
+          });
         }
-      } // ← chunk loop ends here
 
+        // Update progress: contacts = 5% to 80%
+        setProgress(5 + Math.round(((i + chunkSize) / parsedRows.length) * 75));
+        setProgressLabel(`Importing contacts... ${Math.min(i + chunkSize, parsedRows.length).toLocaleString()} / ${parsedRows.length.toLocaleString()}`);
+      }
+
+      // ── STEP 5: Build ALL contact_tags rows in memory (no API calls) ──
+      setProgressLabel('Linking tags...');
+      setProgress(80);
+
+      const contactTagRows: { contact_id: string; tag_id: string }[] = [];
+      for (const { contactId, rowIndex } of insertedMap) {
+        const tagNames = parsedRows[rowIndex]?.tags ?? [];
+        for (const tagName of tagNames) {
+          const tagId = tagNameToId[tagName];
+          if (tagId) contactTagRows.push({ contact_id: contactId, tag_id: tagId });
+        }
+      }
+
+      // ── STEP 6: Insert ALL contact_tags in chunks of 2000 (few API calls) ──
+      if (contactTagRows.length > 0) {
+        const tagChunkSize = 2000;
+        for (let i = 0; i < contactTagRows.length; i += tagChunkSize) {
+          await supabase
+            .from('contact_tags')
+            .insert(contactTagRows.slice(i, i + tagChunkSize));
+          setProgress(80 + Math.round(((i + tagChunkSize) / contactTagRows.length) * 20));
+        }
+      }
+
+      setProgress(100);
+      setProgressLabel('Done!');
       setResult({ imported, failed });
+
       if (imported > 0) {
-        toast.success(`${imported} contact${imported !== 1 ? 's' : ''} imported`);
+        toast.success(`${imported.toLocaleString()} contact${imported !== 1 ? 's' : ''} imported`);
         onImported();
       }
       if (failed > 0) {
-        toast.error(`${failed} contact${failed !== 1 ? 's' : ''} failed to import`);
+        toast.error(`${failed.toLocaleString()} contact${failed !== 1 ? 's' : ''} failed to import`);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Import failed';
@@ -230,35 +265,38 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="bg-slate-900 border-slate-700 text-slate-200 sm:max-w-lg flex flex-col max-h-[90vh] overflow-hidden">
-        <DialogHeader className='shrink-0'>
+        <DialogHeader className="shrink-0">
           <DialogTitle className="text-white">Import Contacts</DialogTitle>
           <DialogDescription className="text-slate-400">
             Upload a CSV file with a &quot;phone&quot; column (required). Optional columns:
-            name, email, company, tags. Separate multiple tags with a semicolon (e.g. VIP;Lead).
+            name, email, company, tags. Separate multiple tags with a comma or semicolon (e.g. VIP,Lead or VIP;Lead).
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4 overflow-y-auto flex-1 py-2 pr-1">
+
           {/* Upload area */}
           <div
-            onClick={() => fileInputRef.current?.click()}
-            className="flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-slate-700 p-6 cursor-pointer hover:border-primary/50 transition-colors"
+            onClick={() => !importing && fileInputRef.current?.click()}
+            className={`flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed p-6 transition-colors ${
+              importing
+                ? 'border-slate-700 cursor-not-allowed opacity-50'
+                : 'border-slate-700 cursor-pointer hover:border-primary/50'
+            }`}
           >
             {file ? (
               <>
                 <FileText className="size-8 text-primary" />
                 <p className="text-sm text-slate-300">{file.name}</p>
                 <p className="text-xs text-slate-500">
-                  {parsedRows.length} row{parsedRows.length !== 1 ? 's' : ''} detected
+                  {parsedRows.length.toLocaleString()} row{parsedRows.length !== 1 ? 's' : ''} detected
                 </p>
               </>
             ) : (
               <>
                 <Upload className="size-8 text-slate-500" />
                 <p className="text-sm text-slate-400">Click to upload CSV file</p>
-                <p className="text-xs text-slate-500">
-                  CSV with &quot;phone&quot; column required
-                </p>
+                <p className="text-xs text-slate-500">CSV with &quot;phone&quot; column required</p>
               </>
             )}
           </div>
@@ -272,40 +310,58 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
           />
 
           {/* Preview table */}
-          {preview.length > 0 && !result && (
+          {preview.length > 0 && !result && !importing && (
             <div className="space-y-2">
               <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-                Preview (first {preview.length} rows)
+                Preview (first 3 rows)
               </p>
               <div className="rounded-lg border border-slate-700 overflow-hidden">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="bg-slate-800">
-                      <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Phone</th>
-                      <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Name</th>
-                      <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Email</th>
-                      <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Company</th>
-                      <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Tags</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {preview.map((row, i) => (
-                      <tr key={i} className="border-t border-slate-700/50">
-                        <td className="px-3 py-1.5 text-slate-300">{row.phone}</td>
-                        <td className="px-3 py-1.5 text-slate-300">{row.name || '-'}</td>
-                        <td className="px-3 py-1.5 text-slate-300">{row.email || '-'}</td>
-                        <td className="px-3 py-1.5 text-slate-300">{row.company || '-'}</td>
-                        <td className="px-3 py-1.5 text-slate-300">{row.tags?.join(', ') || '-'}</td>
+                <div className="overflow-x-auto max-h-36 overflow-y-auto">
+                  <table className="w-full text-xs">
+                    <thead className="sticky top-0 z-10">
+                      <tr className="bg-slate-800">
+                        <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Phone</th>
+                        <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Name</th>
+                        <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Email</th>
+                        <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Company</th>
+                        <th className="px-3 py-1.5 text-left text-slate-400 font-medium">Tags</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {preview.map((row, i) => (
+                        <tr key={i} className="border-t border-slate-700/50">
+                          <td className="px-3 py-1.5 text-slate-300">{row.phone}</td>
+                          <td className="px-3 py-1.5 text-slate-300">{row.name || '-'}</td>
+                          <td className="px-3 py-1.5 text-slate-300">{row.email || '-'}</td>
+                          <td className="px-3 py-1.5 text-slate-300">{row.company || '-'}</td>
+                          <td className="px-3 py-1.5 text-slate-300">{row.tags?.join(', ') || '-'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
               {parsedRows.length > 3 && (
                 <p className="text-xs text-slate-500">
-                  ...and {parsedRows.length - 3} more rows
+                  ...and {(parsedRows.length - 3).toLocaleString()} more rows
                 </p>
               )}
+            </div>
+          )}
+
+          {/* Progress bar while importing */}
+          {importing && (
+            <div className="space-y-2">
+              <div className="flex justify-between text-xs text-slate-400">
+                <span>{progressLabel}</span>
+                <span>{progress}%</span>
+              </div>
+              <div className="w-full h-2 bg-slate-700 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-primary rounded-full transition-all duration-300"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
             </div>
           )}
 
@@ -317,13 +373,13 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
                 {result.imported > 0 && (
                   <div className="flex items-center gap-1.5 text-primary text-sm">
                     <CheckCircle className="size-4" />
-                    {result.imported} imported
+                    {result.imported.toLocaleString()} imported
                   </div>
                 )}
                 {result.failed > 0 && (
                   <div className="flex items-center gap-1.5 text-red-400 text-sm">
                     <XCircle className="size-4" />
-                    {result.failed} failed
+                    {result.failed.toLocaleString()} failed
                   </div>
                 )}
               </div>
@@ -331,12 +387,13 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
           )}
         </div>
 
-        <DialogFooter className="shrink-0 bg-slate-900 border-t border-slate-700 pt-3">
+        <DialogFooter className="shrink-0 border-t border-slate-700 pt-3 bg-slate-900">
           <Button
             type="button"
             variant="outline"
             onClick={() => handleOpenChange(false)}
-            className="border-slate-700 text-slate-300 hover:bg-slate-800"
+            disabled={importing}
+            className="border-slate-700 text-slate-300 hover:bg-slate-800 disabled:opacity-50"
           >
             {result ? 'Close' : 'Cancel'}
           </Button>
@@ -348,7 +405,7 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
               className="bg-primary hover:bg-primary/90 text-primary-foreground"
             >
               {importing && <Loader2 className="size-4 animate-spin" />}
-              Import {parsedRows.length > 0 ? `${parsedRows.length} Contacts` : ''}
+              Import {parsedRows.length > 0 ? `${parsedRows.length.toLocaleString()} Contacts` : ''}
             </Button>
           )}
         </DialogFooter>
