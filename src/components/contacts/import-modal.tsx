@@ -83,6 +83,38 @@ function parseCSV(text: string): ParsedRow[] {
   return rows;
 }
 
+// Split array into chunks
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
+}
+
+// Run async tasks with limited concurrency (like Promise.all but controlled)
+async function runWithConcurrency<T>(
+  tasks: (() => Promise<T>)[],
+  concurrency: number,
+  onProgress?: (done: number, total: number) => void
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let nextIndex = 0;
+  let doneCount = 0;
+
+  async function worker() {
+    while (nextIndex < tasks.length) {
+      const index = nextIndex++;
+      results[index] = await tasks[index]();
+      doneCount++;
+      onProgress?.(doneCount, tasks.length);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, tasks.length) }, worker)
+  );
+  return results;
+}
+
 export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps) {
   const supabase = createClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -134,25 +166,22 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
       const user = session?.user;
       if (!user) throw new Error('Not authenticated');
 
-      // ── STEP 1: Collect ALL unique tag names from entire CSV (1 pass, no API calls) ──
+      // ── STEP 1: Collect unique tag names (in memory, zero API calls) ──
       const allTagNames = Array.from(
         new Set(parsedRows.flatMap((r) => r.tags ?? []).filter(Boolean))
       );
-
-      // tagNameToId will hold name → uuid for every tag we need
       const tagNameToId: Record<string, string> = {};
 
       if (allTagNames.length > 0) {
-        // ── STEP 2: Fetch ALL existing tags in ONE single API call ──
+        // ── STEP 2: ONE call to fetch existing tags ──
         const { data: existingTags } = await supabase
           .from('tags')
           .select('id, name')
           .eq('user_id', user.id)
           .in('name', allTagNames);
-
         existingTags?.forEach((t) => { tagNameToId[t.name] = t.id; });
 
-        // ── STEP 3: Create ONLY missing tags in ONE batch insert ──
+        // ── STEP 3: ONE batch insert for missing tags ──
         const missingNames = allTagNames.filter((n) => !tagNameToId[n]);
         if (missingNames.length > 0) {
           const { data: newTags } = await supabase
@@ -166,17 +195,20 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
       setProgress(5);
       setProgressLabel('Importing contacts...');
 
-      // ── STEP 4: Insert contacts in chunks of 1000 ──
+      // ── STEP 4: Split into chunks of 200, run 8 in parallel ──
+      // 200 rows × 8 parallel = 1600 rows processed simultaneously
+      const CHUNK_SIZE = 200;
+      const CONCURRENCY = 8;
+      const chunks = chunkArray(parsedRows, CHUNK_SIZE);
+
       let imported = 0;
       let failed = 0;
-      const chunkSize = 1000;
+      // Store inserted contacts per chunk to preserve order for tag linking
+      const insertedByChunk: { contactId: string; rowIndex: number }[][] =
+        chunks.map(() => []);
 
-      // We need to track which inserted contact ID maps to which CSV row
-      // so we can build contact_tags later
-      const insertedMap: { contactId: string; rowIndex: number }[] = [];
-
-      for (let i = 0; i < parsedRows.length; i += chunkSize) {
-        const chunk = parsedRows.slice(i, i + chunkSize);
+      const contactTasks = chunks.map((chunk, chunkIdx) => async () => {
+        const baseIndex = chunkIdx * CHUNK_SIZE;
         const rows = chunk.map((row) => ({
           user_id: user.id,
           phone: row.phone,
@@ -191,7 +223,7 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
           .select('id');
 
         if (error) {
-          // Chunk failed — try row by row as fallback
+          // Fallback: insert individually
           for (let j = 0; j < chunk.length; j++) {
             const { data: single, error: singleErr } = await supabase
               .from('contacts')
@@ -202,43 +234,50 @@ export function ImportModal({ open, onOpenChange, onImported }: ImportModalProps
               failed++;
             } else {
               imported++;
-              insertedMap.push({ contactId: single.id, rowIndex: i + j });
+              insertedByChunk[chunkIdx].push({ contactId: single.id, rowIndex: baseIndex + j });
             }
           }
         } else {
           imported += data?.length ?? 0;
           data?.forEach((d, j) => {
-            insertedMap.push({ contactId: d.id, rowIndex: i + j });
+            insertedByChunk[chunkIdx].push({ contactId: d.id, rowIndex: baseIndex + j });
           });
         }
+      });
 
-        // Update progress: contacts = 5% to 80%
-        setProgress(5 + Math.round(((i + chunkSize) / parsedRows.length) * 75));
-        setProgressLabel(`Importing contacts... ${Math.min(i + chunkSize, parsedRows.length).toLocaleString()} / ${parsedRows.length.toLocaleString()}`);
-      }
+      await runWithConcurrency(contactTasks, CONCURRENCY, (done, total) => {
+        const contactsDone = Math.min(done * CHUNK_SIZE, parsedRows.length);
+        setProgress(5 + Math.round((done / total) * 70));
+        setProgressLabel(
+          `Importing contacts... ${contactsDone.toLocaleString()} / ${parsedRows.length.toLocaleString()}`
+        );
+      });
 
-      // ── STEP 5: Build ALL contact_tags rows in memory (no API calls) ──
+      // ── STEP 5: Build contact_tags rows in memory (zero API calls) ──
       setProgressLabel('Linking tags...');
-      setProgress(80);
+      setProgress(78);
 
       const contactTagRows: { contact_id: string; tag_id: string }[] = [];
-      for (const { contactId, rowIndex } of insertedMap) {
-        const tagNames = parsedRows[rowIndex]?.tags ?? [];
-        for (const tagName of tagNames) {
-          const tagId = tagNameToId[tagName];
-          if (tagId) contactTagRows.push({ contact_id: contactId, tag_id: tagId });
+      for (const chunkEntries of insertedByChunk) {
+        for (const { contactId, rowIndex } of chunkEntries) {
+          for (const tagName of parsedRows[rowIndex]?.tags ?? []) {
+            const tagId = tagNameToId[tagName];
+            if (tagId) contactTagRows.push({ contact_id: contactId, tag_id: tagId });
+          }
         }
       }
 
-      // ── STEP 6: Insert ALL contact_tags in chunks of 2000 (few API calls) ──
+      // ── STEP 6: Insert contact_tags in parallel chunks of 1000 ──
       if (contactTagRows.length > 0) {
-        const tagChunkSize = 2000;
-        for (let i = 0; i < contactTagRows.length; i += tagChunkSize) {
-          await supabase
-            .from('contact_tags')
-            .insert(contactTagRows.slice(i, i + tagChunkSize));
-          setProgress(80 + Math.round(((i + tagChunkSize) / contactTagRows.length) * 20));
-        }
+        const tagChunks = chunkArray(contactTagRows, 1000);
+        const tagTasks = tagChunks.map((chunk) => async () => {
+          await supabase.from('contact_tags').insert(chunk);
+        });
+
+        await runWithConcurrency(tagTasks, 8, (done, total) => {
+          setProgress(78 + Math.round((done / total) * 22));
+          setProgressLabel(`Linking tags... ${done} / ${total} batches`);
+        });
       }
 
       setProgress(100);
