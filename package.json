@@ -47,7 +47,7 @@
     "@supabase/supabase-js": "^2.106.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "date-fns": "^4.1.0",
+    "date-fns": "^4.3.0",
     "lucide-react": "^1.8.0",
     "next": "16.2.6",
     "opencode-ai": "^1.15.11",
