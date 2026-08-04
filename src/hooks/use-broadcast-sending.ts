@@ -3,6 +3,10 @@
 import { useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { Contact, MessageTemplate } from '@/types';
+import {
+  orderVariableKeys,
+  type TemplateVariableValue,
+} from '@/lib/whatsapp/template-variables';
 
 export type CustomFieldOperator = 'is' | 'is_not' | 'contains';
 
@@ -22,9 +26,10 @@ export interface AudienceConfig {
 }
 
 /**
- * Variable mapping — each template placeholder (by key, usually "1",
- * "2", …) is resolved at send time. `field` maps to a built-in contact
- * field (name/phone/email/company); `custom_field` maps to a
+ * Variable mapping — each template placeholder (by key: "1", "2", …
+ * for positional, or "customer_name"/"product_name" for named) is
+ * resolved at send time. `field` maps to a built-in contact field
+ * (name/phone/email/company); `custom_field` maps to a
  * contact_custom_values.value row keyed by the custom_fields.id stored
  * in `value`.
  */
@@ -72,27 +77,29 @@ interface BroadcastApiResult {
 type CustomValueIndex = Map<string, Map<string, string>>;
 
 /**
- * Per-contact resolution of custom-field placeholders. Static and
+ * Per-contact resolution of template placeholders. Static and
  * built-in-field mappings resolve synchronously; custom fields read
  * from a pre-built index to avoid N+1 queries during the send loop.
+ *
+ * The returned array is ordered — values[i] fills the i-th
+ * {{placeholder}} in the template body — so `body` orders the keys
+ * (body order for both named and numeric placeholders, not
+ * alphabetical). Each value carries its placeholder `key`, which the
+ * Meta parameter builder uses to emit `parameter_name` for named
+ * placeholders. Without `body` the keys fall back to numeric-aware
+ * order to preserve legacy behaviour.
  */
 export function resolveVariables(
   variables: Record<string, VariableMapping>,
   contact: Contact,
   customValues?: Map<string, string>,
-): string[] {
-  // Keys are typically "1","2",... — numeric-aware sort keeps
-  // {{1}} before {{10}}.
-  const keys = Object.keys(variables).sort((a, b) => {
-    const an = Number(a);
-    const bn = Number(b);
-    if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
-    return a.localeCompare(b);
-  });
+  body?: string,
+): TemplateVariableValue[] {
+  const keys = orderVariableKeys(variables, body);
 
   return keys.map((key) => {
     const v = variables[key];
-    if (v.type === 'static') return v.value;
+    if (v.type === 'static') return { key, value: v.value };
 
     if (v.type === 'field') {
       const fieldMap: Record<string, string | undefined> = {
@@ -101,11 +108,11 @@ export function resolveVariables(
         email: contact.email,
         company: contact.company,
       };
-      return fieldMap[v.value] ?? '';
+      return { key, value: fieldMap[v.value] ?? '' };
     }
 
     // custom_field
-    return customValues?.get(v.value) ?? '';
+    return { key, value: customValues?.get(v.value) ?? '' };
   });
 }
 
@@ -436,6 +443,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
                   payload.variables,
                   r.contact,
                   customValueIndex.get(r.contact.id),
+                  payload.template.body_text,
                 )
               : [],
           }));

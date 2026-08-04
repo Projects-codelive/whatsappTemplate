@@ -13,6 +13,12 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { ArrowLeft, ArrowRight, Eye, Loader2 } from 'lucide-react';
+import {
+  extractPlaceholders,
+  formatPlaceholderLabel,
+  isNumericPlaceholderKey,
+  placeholderKey,
+} from '@/lib/whatsapp/template-variables';
 
 type VariableType = 'static' | 'field' | 'custom_field';
 
@@ -106,9 +112,7 @@ export function Step3Personalize({
   }, []);
 
   const placeholders = useMemo(() => {
-    const matches = template.body_text.match(/\{\{(\d+)\}\}/g);
-    if (!matches) return [];
-    return [...new Set(matches)].sort();
+    return extractPlaceholders(template.body_text);
   }, [template.body_text]);
 
   /**
@@ -120,7 +124,7 @@ export function Step3Personalize({
   const unmappedKeys = useMemo(() => {
     const missing: string[] = [];
     for (const placeholder of placeholders) {
-      const key = placeholder.replace(/^\{\{|\}\}$/g, '');
+      const key = placeholderKey(placeholder);
       const mapping = variables[key];
       if (!mapping || !mapping.value?.trim()) {
         missing.push(placeholder);
@@ -139,7 +143,8 @@ export function Step3Personalize({
 
   /**
    * Substitute placeholders using the first real contact where
-   * possible. Placeholders keyed by "{{N}}" map to variable key "N".
+   * possible. {{token}} maps to the variable key of the same name
+   * ("{{1}}" → "1", "{{customer_name}}" → "customer_name").
    */
   const previewText = useMemo(() => {
     const contact = firstContact ?? SAMPLE_CONTACT;
@@ -149,7 +154,7 @@ export function Step3Personalize({
 
     let text = template.body_text;
     for (const placeholder of placeholders) {
-      const key = placeholder.replace(/^\{\{|\}\}$/g, '');
+      const key = placeholderKey(placeholder);
       const mapping = variables[key];
       let replacement = placeholder;
 
@@ -202,7 +207,7 @@ export function Step3Personalize({
       ) : (
         <div className="space-y-4">
           {placeholders.map((placeholder) => {
-            const key = placeholder.replace(/^\{\{|\}\}$/g, '');
+            const key = placeholderKey(placeholder);
             const mapping = variables[key] ?? { type: 'static', value: '' };
 
             return (
@@ -212,8 +217,13 @@ export function Step3Personalize({
               >
                 <div className="mb-3 flex items-center gap-2">
                   <span className="inline-flex items-center rounded-md bg-primary/10 px-2 py-0.5 text-xs font-mono font-medium text-primary">
-                    {placeholder}
+                    {formatPlaceholderLabel(key)}
                   </span>
+                  {!isNumericPlaceholderKey(key) && (
+                    <span className="text-xs text-slate-500">
+                      {placeholder}
+                    </span>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

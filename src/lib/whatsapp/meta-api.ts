@@ -9,6 +9,12 @@
  * instead of a runtime rejection from Meta.
  */
 
+import type { TemplateVariableValue } from './template-variables'
+import {
+  buildBodyParameters,
+  normalizeTemplateParameters,
+} from './template-variables'
+
 const META_API_VERSION = 'v21.0'
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
 
@@ -24,18 +30,60 @@ export interface MetaPhoneInfo {
 }
 
 interface MetaErrorResponse {
-  error?: { message?: string; code?: number; type?: string }
+  error?: {
+    message?: string
+    type?: string
+    code?: number
+    error_subcode?: number
+    error_data?: { details?: string }
+    fbtrace_id?: string
+  }
 }
 
+/**
+ * Throws a Meta API error without discarding any diagnostic fields.
+ * The complete response is logged structured; the thrown Error carries
+ * the fields as labelled lines so downstream sinks (Vercel logs,
+ * broadcast_recipients.error_message) retain the full reason. The
+ * original `error.message` text is kept verbatim on the first line so
+ * substring-based checks (isRecipientNotAllowedError) keep working.
+ */
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback
+  let type: string | undefined
+  let code: number | undefined
+  let subcode: number | undefined
+  let details: string | undefined
+  let traceId: string | undefined
+
   try {
     const data = (await response.json()) as MetaErrorResponse
-    if (data.error?.message) message = data.error.message
+    const err = data.error
+    if (err?.message) message = err.message
+    type = err?.type
+    code = err?.code
+    subcode = err?.error_subcode
+    details = err?.error_data?.details
+    traceId = err?.fbtrace_id
   } catch {
     // response body wasn't JSON — keep the fallback
   }
-  throw new Error(message)
+
+  console.error('[meta-api] Meta API error response', {
+    message,
+    type,
+    code,
+    error_subcode: subcode,
+    error_data: { details },
+    fbtrace_id: traceId,
+  })
+
+  const parts = [`Message: ${message}`]
+  if (details) parts.push(`Details: ${details}`)
+  if (subcode !== undefined) parts.push(`Subcode: ${subcode}`)
+  if (traceId) parts.push(`Trace: ${traceId}`)
+
+  throw new Error(parts.join('\n'))
 }
 
 // ============================================================
@@ -119,7 +167,15 @@ export interface SendTemplateMessageArgs {
   to: string
   templateName: string
   language?: string
-  params?: string[]
+  /**
+   * Ordered resolved placeholder values.
+   *
+   * Prefer `TemplateVariableValue[]` ({ key, value }) — the key drives
+   * the Meta payload: named keys emit `parameter_name`, numeric keys stay
+   * bare. Legacy positional `string[]` is still accepted and emitted as
+   * bare `{ type: "text", text }` parameters, exactly as before.
+   */
+  params?: TemplateVariableValue[] | string[]
   /** Meta's message_id of the message being replied to. */
   contextMessageId?: string
 }
@@ -147,11 +203,12 @@ export async function sendTemplateMessage(
     language: { code: language },
   }
 
-  if (params && params.length > 0) {
+  const keyedParams = normalizeTemplateParameters(params)
+  if (keyedParams && keyedParams.length > 0) {
     template.components = [
       {
         type: 'body',
-        parameters: params.map((p) => ({ type: 'text', text: String(p) })),
+        parameters: buildBodyParameters(keyedParams),
       },
     ]
   }
@@ -167,6 +224,10 @@ export async function sendTemplateMessage(
     body.context = { message_id: contextMessageId }
   }
 
+  console.log("========== META PAYLOAD ==========");
+  console.log(JSON.stringify(body, null, 2));
+  console.log("==================================");
+
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -175,6 +236,13 @@ export async function sendTemplateMessage(
     },
     body: JSON.stringify(body),
   })
+
+  const responseForLog = response.clone();
+  const responseText = await responseForLog.text().catch(() => '(unreadable)');
+  console.log("========== META RESPONSE ==========");
+  console.log(responseText);
+  console.log("==================================");
+
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }

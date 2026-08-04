@@ -16,6 +16,7 @@ import type {
 } from '@/types'
 import { supabaseAdmin } from './admin-client'
 import { engineSendText, engineSendTemplate } from './meta-send'
+import { orderVariableKeys } from '@/lib/whatsapp/template-variables'
 
 // ------------------------------------------------------------
 // Public API
@@ -318,23 +319,27 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
       if (!args.contactId) throw new Error('send_template needs a contact')
       if (!cfg.template_name) throw new Error('send_template needs template_name')
       const conversationId = await resolveConversationId(args)
-      // Meta templates use positional {{1}}, {{2}}, … placeholders, so
-      // we MUST emit params in strict numeric order. Lexicographic sort
-      // of "1", "2", …, "10" yields "1", "10", "2", … which silently
-      // scrambles every template with ≥10 variables.
+      // Meta templates use positional {{1}}, {{2}}, … or named
+      // {{customer_name}} placeholders, and params MUST be emitted in
+      // the order the placeholders appear in the approved template body.
+      // Order the keys against the synced body_text; fall back to
+      // numeric-aware key order when the row can't be found so legacy
+      // automations keep working.
+      let bodyText: string | undefined
+      const { data: templateRow } = await db
+        .from('message_templates')
+        .select('body_text')
+        .eq('user_id', args.automation.user_id)
+        .eq('name', cfg.template_name)
+        .limit(1)
+      if (templateRow && typeof templateRow[0]?.body_text === 'string') {
+        bodyText = templateRow[0].body_text
+      }
       const params = cfg.variables
-        ? Object.keys(cfg.variables)
-            .sort((a, b) => {
-              const na = Number(a)
-              const nb = Number(b)
-              const aNum = Number.isFinite(na)
-              const bNum = Number.isFinite(nb)
-              if (aNum && bNum) return na - nb
-              if (aNum) return -1
-              if (bNum) return 1
-              return a.localeCompare(b)
-            })
-            .map((k) => String(cfg.variables![k]))
+        ? orderVariableKeys(cfg.variables, bodyText).map((k) => ({
+            key: k,
+            value: String(cfg.variables![k]),
+          }))
         : []
       const { whatsapp_message_id } = await engineSendTemplate({
         userId: args.automation.user_id,

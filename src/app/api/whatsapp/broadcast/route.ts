@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
+import type { TemplateVariableValue } from '@/lib/whatsapp/template-variables'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   sanitizePhoneForMeta,
@@ -26,7 +27,7 @@ interface BroadcastResult {
  *
  *   NEW (preferred — supports per-recipient variable substitution):
  *     {
- *       recipients: Array<{ phone: string; params: string[] }>,
+ *       recipients: Array<{ phone: string; params: Array<{key,value}> | string[] }>,
  *       template_name, template_language
  *     }
  *
@@ -42,10 +43,16 @@ interface BroadcastResult {
  * sending hook was forced to ship every batch with `templateParams[0]`
  * — meaning every recipient got contact-0's personalization. The new
  * shape is what actually fixes that.
+ *
+ * `recipients[].params` may be either the legacy positional `string[]`
+ * (bare `{type:"text", text}` Meta parameters) or the structured
+ * `Array<{key,value}>` form, where a non-numeric `key` makes
+ * `sendTemplateMessage` emit `parameter_name` — the field Meta requires
+ * for named-format templates.
  */
 interface NewRecipient {
   phone: string
-  params?: string[]
+  params?: TemplateVariableValue[] | string[]
 }
 
 export async function POST(request: Request) {

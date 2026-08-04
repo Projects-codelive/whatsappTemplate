@@ -21,32 +21,26 @@ import {
   LayoutTemplate,
   Loader2,
 } from "lucide-react";
+import {
+  extractPlaceholderKeys,
+  formatPlaceholderLabel,
+  isNumericPlaceholderKey,
+  renderTemplateBody,
+  type TemplateVariableValue,
+} from "@/lib/whatsapp/template-variables";
 
 interface TemplatePickerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onSelect: (template: MessageTemplate, params: string[]) => void;
+  onSelect: (template: MessageTemplate, params: TemplateVariableValue[]) => void;
 }
 
-// Meta numbers template placeholders from 1 ({{1}}, {{2}}, …) and the
-// indices passed to the Graph API must be contiguous starting at 1.
-// We sort + dedupe here so a body using only {{2}} still drives a single
-// input slot, and so render-order matches send-order.
-function extractVariables(body: string): number[] {
-  const ids = new Set<number>();
-  for (const m of body.matchAll(/\{\{(\d+)\}\}/g)) {
-    ids.add(Number(m[1]));
-  }
-  return Array.from(ids).sort((a, b) => a - b);
-}
-
-function renderBodyPreview(body: string, params: string[]): string {
-  return body.replace(/\{\{(\d+)\}\}/g, (_, raw) => {
-    const idx = Number(raw) - 1;
-    const value = params[idx];
-    return value && value.trim().length > 0 ? value : `{{${raw}}}`;
-  });
-}
+// Meta numbers template placeholders from 1 ({{1}}, {{2}}, …) or names
+// them ({{customer_name}}, {{product_name}}, …); the params passed to the
+// Graph API must be contiguous and ordered by appearance in the body.
+// Each value keeps its placeholder `key` so named templates can emit
+// Meta's required `parameter_name` field. Keys are de-duplicated here so
+// a body using a variable twice still drives a single input slot.
 
 export function TemplatePicker({
   open,
@@ -56,7 +50,7 @@ export function TemplatePicker({
   const [templates, setTemplates] = useState<MessageTemplate[]>([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<MessageTemplate | null>(null);
-  const [params, setParams] = useState<string[]>([]);
+  const [params, setParams] = useState<TemplateVariableValue[]>([]);
 
   useEffect(() => {
     if (!open) return;
@@ -111,14 +105,14 @@ export function TemplatePicker({
   }
 
   function pickTemplate(template: MessageTemplate) {
-    const vars = extractVariables(template.body_text);
+    const vars = extractPlaceholderKeys(template.body_text);
     if (vars.length === 0) {
       onSelect(template, []);
       handleOpenChange(false);
       return;
     }
     setSelected(template);
-    setParams(new Array(vars.length).fill(""));
+    setParams(vars.map((key) => ({ key, value: "" })));
   }
 
   function confirm() {
@@ -127,10 +121,9 @@ export function TemplatePicker({
     handleOpenChange(false);
   }
 
-  const variables = selected ? extractVariables(selected.body_text) : [];
+  const variables = selected ? extractPlaceholderKeys(selected.body_text) : [];
   const canConfirm =
-    !!selected &&
-    variables.every((_, i) => (params[i] ?? "").trim().length > 0);
+    !!selected && params.every((p) => p.value.trim().length > 0);
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -199,7 +192,10 @@ export function TemplatePicker({
             <div className="rounded-md border border-slate-800 bg-slate-950/50 p-3">
               <p className="mb-1 text-xs text-slate-400">Preview</p>
               <p className="whitespace-pre-wrap text-sm text-slate-200">
-                {renderBodyPreview(selected.body_text, params)}
+                {renderTemplateBody(
+                  selected.body_text,
+                  params.map((p) => p.value),
+                )}
               </p>
               {selected.footer_text && (
                 <p className="mt-2 text-xs italic text-slate-500">
@@ -209,12 +205,16 @@ export function TemplatePicker({
             </div>
             {variables.map((v, i) => (
               <div key={v} className="space-y-1">
-                <Label className="text-xs text-slate-300">{`Variable {{${v}}}`}</Label>
+                <Label className="text-xs text-slate-300">
+                  {isNumericPlaceholderKey(v)
+                    ? `Variable {{${v}}}`
+                    : formatPlaceholderLabel(v)}
+                </Label>
                 <Input
-                  value={params[i] ?? ""}
+                  value={params[i]?.value ?? ""}
                   onChange={(e) => {
                     const next = [...params];
-                    next[i] = e.target.value;
+                    next[i] = { ...next[i], value: e.target.value };
                     setParams(next);
                   }}
                   placeholder={`Value for {{${v}}}`}

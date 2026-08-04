@@ -3,6 +3,7 @@ import {
   INTERACTIVE_LIMITS,
   sendInteractiveButtons,
   sendInteractiveList,
+  sendTemplateMessage,
 } from "./meta-api";
 
 // All assertions in this file run BEFORE the network call. We stub fetch
@@ -265,5 +266,152 @@ describe("sendInteractiveList — validation", () => {
         },
       },
     });
+  });
+});
+
+describe("sendTemplateMessage — Meta error diagnostics", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("logs the complete Meta error response and throws all diagnostic fields", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: "Invalid parameter",
+              type: "OAuthException",
+              code: 100,
+              error_subcode: 2494073,
+              error_data: {
+                details:
+                  'Parameter 2 ("product_name") contains invalid value',
+              },
+              fbtrace_id: "A1BC...",
+            },
+          }),
+          { status: 400 },
+        );
+      }),
+    );
+
+    await expect(
+      sendTemplateMessage({
+        phoneNumberId: "test-phone",
+        accessToken: "test-token",
+        to: "1234567890",
+        templateName: "cancellation_confirmation_edu",
+        language: "en_US",
+        params: ["Target 2 Hit", "P&L booked ₹6,250 per lot, Big Day !"],
+      }),
+    ).rejects.toThrow(
+      /Message: Invalid parameter[\s\S]*Details: Parameter 2 \("product_name"\) contains invalid value[\s\S]*Subcode: 2494073[\s\S]*Trace: A1BC\.\.\./,
+    );
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[meta-api] Meta API error response"),
+      expect.objectContaining({
+        message: "Invalid parameter",
+        type: "OAuthException",
+        code: 100,
+        error_subcode: 2494073,
+        error_data: { details: 'Parameter 2 ("product_name") contains invalid value' },
+        fbtrace_id: "A1BC...",
+      }),
+    );
+    consoleSpy.mockRestore();
+  });
+
+  it("falls back to the status-based message when the body is not JSON", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not json", { status: 502 })),
+    );
+
+    await expect(
+      sendTemplateMessage({
+        phoneNumberId: "test-phone",
+        accessToken: "test-token",
+        to: "1234567890",
+        templateName: "cancellation_confirmation_edu",
+        language: "en_US",
+        params: ["Target 2 Hit"],
+      }),
+    ).rejects.toThrow(/Message: Meta API error: 502/);
+  });
+});
+
+describe("sendTemplateMessage — parameter payload shape", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  type TestParams = string[] | { key: string; value: string }[];
+
+  async function capturePayload(params: TestParams) {
+    let captured: unknown = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        captured = JSON.parse(String(init.body));
+        return new Response(
+          JSON.stringify({ messages: [{ id: "wamid.T" }] }),
+          { status: 200 },
+        );
+      }),
+    );
+    await sendTemplateMessage({
+      phoneNumberId: "test-phone",
+      accessToken: "test-token",
+      to: "1234567890",
+      templateName: "order_confirmation",
+      language: "en_US",
+      params: params as never,
+    });
+    return captured;
+  }
+
+  it("emits bare text parameters for positional {{1}}, {{2}}", async () => {
+    const body = (await capturePayload(["Target 2 Hit", "OTP 1234"])) as {
+      template: { components: { parameters: unknown[] }[] };
+    };
+    expect(body.template.components[0].parameters).toEqual([
+      { type: "text", text: "Target 2 Hit" },
+      { type: "text", text: "OTP 1234" },
+    ]);
+  });
+
+  it("emits parameter_name for named {{customer_name}}, {{product_name}}", async () => {
+    const body = (await capturePayload([
+      { key: "customer_name", value: "Target 2 Hit" },
+      { key: "product_name", value: "P&L booked ₹6,250 per lot, Big Day !" },
+    ])) as { template: { components: { parameters: unknown[] }[] } };
+    expect(body.template.components[0].parameters).toEqual([
+      { type: "text", parameter_name: "customer_name", text: "Target 2 Hit" },
+      {
+        type: "text",
+        parameter_name: "product_name",
+        text: "P&L booked ₹6,250 per lot, Big Day !",
+      },
+    ]);
+  });
+
+  it("emits per-key objects for a mixed body", async () => {
+    const body = (await capturePayload([
+      { key: "1", value: "Target 2 Hit" },
+      { key: "product_name", value: "Acme Corp" },
+    ])) as { template: { components: { parameters: unknown[] }[] } };
+    expect(body.template.components[0].parameters).toEqual([
+      { type: "text", text: "Target 2 Hit" },
+      { type: "text", parameter_name: "product_name", text: "Acme Corp" },
+    ]);
+  });
+
+  it("omits components entirely when there are no params", async () => {
+    const body = (await capturePayload([])) as { template: Record<string, unknown> };
+    expect(body.template.components).toBeUndefined();
   });
 });

@@ -426,7 +426,7 @@ export function TemplateManager() {
             <div className="space-y-2">
               <Label className="text-slate-300">Body Text</Label>
               <Textarea
-                placeholder="Enter your template message body. Use {{1}}, {{2}} for variables."
+                placeholder="Enter your template message body. Use {{1}}, {{2}} or named variables like {{customer_name}}."
                 value={form.body_text}
                 onChange={(e) => setForm({ ...form, body_text: e.target.value })}
                 rows={4}

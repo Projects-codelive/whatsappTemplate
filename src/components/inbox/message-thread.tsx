@@ -37,19 +37,16 @@ import { MessageActions } from "./message-actions";
 import { MessageComposer } from "./message-composer";
 import { TemplatePicker } from "./template-picker";
 import { buildReplyPreview } from "./reply-quote";
+import {
+  renderTemplateBody,
+  type TemplateVariableValue,
+} from "@/lib/whatsapp/template-variables";
 import { toast } from "sonner";
 
 interface ReplyDraft {
   id: string;
   authorLabel: string;
   preview: string;
-}
-
-function renderTemplateBody(body: string, params: string[]): string {
-  return body.replace(/\{\{(\d+)\}\}/g, (_, raw) => {
-    const idx = Number(raw) - 1;
-    return params[idx] ?? `{{${raw}}}`;
-  });
 }
 
 interface MessageThreadProps {
@@ -493,10 +490,16 @@ export function MessageThread({
   }, []);
 
   const handleSendTemplate = useCallback(
-    async (template: MessageTemplate, params: string[]) => {
+    async (
+      template: MessageTemplate,
+      params: TemplateVariableValue[],
+    ) => {
       if (!conversation) return;
 
-      const renderedBody = renderTemplateBody(template.body_text, params);
+      const renderedBody = renderTemplateBody(
+        template.body_text,
+        params.map((p) => p.value),
+      );
       const tempId = `temp-${Date.now()}`;
 
       const optimisticMsg: Message = {

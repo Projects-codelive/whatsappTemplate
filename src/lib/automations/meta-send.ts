@@ -1,4 +1,5 @@
 import { sendTextMessage, sendTemplateMessage } from '@/lib/whatsapp/meta-api'
+import type { TemplateVariableValue } from '@/lib/whatsapp/template-variables'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   sanitizePhoneForMeta,
@@ -32,7 +33,7 @@ interface SendTemplateArgs {
   contactId: string
   templateName: string
   language?: string
-  params?: string[]
+  params?: TemplateVariableValue[]
 }
 
 export async function engineSendText(args: SendTextArgs): Promise<{ whatsapp_message_id: string }> {
