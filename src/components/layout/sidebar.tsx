@@ -18,6 +18,7 @@ import {
   LogOut,
   User,
   X,
+  Bell,
 } from "lucide-react";
 import {
   Avatar,
@@ -49,6 +50,10 @@ const navItems: NavItem[] = [
   { href: "/contacts", label: "Contacts", icon: Users },
   { href: "/pipelines", label: "Pipelines", icon: GitBranch },
   { href: "/broadcasts", label: "Broadcasts", icon: Radio },
+
+  // New Page
+  { href: "/notifications", label: "Notifications", icon: Bell },
+
   { href: "/automations", label: "Automations", icon: Zap },
   { href: "/flows", label: "Flows", icon: Workflow, beta: true },
 ];

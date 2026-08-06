@@ -409,3 +409,54 @@ export interface AutomationLog {
   created_at: string;
   contact?: Contact;
 }
+
+// ============================================================
+// Notifications
+// ============================================================
+
+/** A user stored in the local Supabase `users` table. */
+export interface NotificationUser {
+  id: string;
+  name: string | null;
+  mobile: string | null;
+  email: string | null;
+  category: string | null;
+  fcm_token: string | null;
+  created_at: string;
+  joined_at: string | null;
+}
+
+export type NotificationTarget = 'selected' | 'all' | 'category';
+
+export interface SelectedUsersNotificationPayload {
+  target: 'selected';
+  userIds: string[];
+  title: string;
+  message: string;
+}
+
+export interface AllUsersNotificationPayload {
+  target: 'all';
+  title: string;
+  message: string;
+}
+
+export interface CategoryNotificationPayload {
+  target: 'category';
+  category: string;
+  title: string;
+  message: string;
+}
+
+export type NotificationPayload =
+  | SelectedUsersNotificationPayload
+  | AllUsersNotificationPayload
+  | CategoryNotificationPayload;
+
+/** Result of a push-notification dispatch. */
+export interface NotificationSendResult {
+  success: boolean;
+  sent: number;
+  failed: number;
+  failedUsers: string[];
+}
