@@ -1,9 +1,12 @@
+import type { SyncUsersResult } from '@/types'
+
 /**
  * Triggers a server-side synchronization of the Niveshbay Users API
- * into the local Supabase `users` table. The page never talks to the
- * upstream API directly — it reads only from Supabase.
+ * into the local Supabase `users` table, then backfills FCM tokens for
+ * users that were missing one. The page never talks to the upstream API
+ * directly — it reads only from Supabase.
  */
-export async function syncUsers(): Promise<number> {
+export async function syncUsers(): Promise<SyncUsersResult> {
   let res: Response
   try {
     res = await fetch('/api/users/sync', { method: 'POST' })
@@ -24,5 +27,14 @@ export async function syncUsers(): Promise<number> {
     throw new Error('Users API returned no users to synchronize')
   }
 
-  return synchronized
+  return {
+    success: json?.success === true,
+    synchronized,
+    checkedForFcm: typeof json?.checkedForFcm === 'number' ? json.checkedForFcm : 0,
+    tokensUpdated: typeof json?.tokensUpdated === 'number' ? json.tokensUpdated : 0,
+    tokenFetchFailed: typeof json?.tokenFetchFailed === 'number' ? json.tokenFetchFailed : 0,
+    typesChecked: typeof json?.typesChecked === 'number' ? json.typesChecked : 0,
+    categoriesUpdated: typeof json?.categoriesUpdated === 'number' ? json.categoriesUpdated : 0,
+    typeFetchFailed: typeof json?.typeFetchFailed === 'number' ? json.typeFetchFailed : 0,
+  }
 }

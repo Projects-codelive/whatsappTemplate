@@ -460,3 +460,24 @@ export interface NotificationSendResult {
   failed: number;
   failedUsers: string[];
 }
+
+/** Result of a Sync Users run, including the FCM-token backfill and
+ *  user-type refresh phases. */
+export interface SyncUsersResult {
+  success: boolean;
+  /** Users upserted into the local `users` table from the Users API. */
+  synchronized: number;
+  /** Users that had a missing FCM token and were checked against the User API. */
+  checkedForFcm: number;
+  /** Missing tokens successfully fetched and persisted. */
+  tokensUpdated: number;
+  /** Missing tokens the User API could not resolve. */
+  tokenFetchFailed: number;
+  /** User-type records the User Type API returned across all pages. */
+  typesChecked: number;
+  /** Users whose `category` was updated (matched by `mobile`). */
+  categoriesUpdated: number;
+  /** User-type records that could not be applied (blank number/type, no
+   *  local match, or an API/Supabase error). */
+  typeFetchFailed: number;
+}

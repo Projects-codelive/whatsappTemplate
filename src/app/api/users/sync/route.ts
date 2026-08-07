@@ -2,11 +2,16 @@ import { NextResponse } from 'next/server'
 import { createHash } from 'node:crypto'
 import { supabaseAdmin } from '@/lib/automations/admin-client'
 import { NOTIFICATION_CATEGORY_ALIASES } from '@/lib/notifications/categories'
-
-const USERS_API_URL =
-  process.env.NIVESHBAY_USERS_API_URL ?? 'https://niveshbay.com/api/v1/users.php'
-const USERS_API_KEY =
-  process.env.NIVESHBAY_USERS_API_KEY ?? 'NBCOURSE_2026@Secure#API'
+import {
+  isErrorStatus,
+  NIVESHBAY_API_KEY,
+  NIVESHBAY_USERS_API_URL,
+} from '@/lib/notifications/niveshbay-api'
+import {
+  backfillMissingFcmTokens,
+  type MissingTokenUser,
+} from '@/lib/notifications/fetch-missing-tokens'
+import { syncUserTypes } from '@/lib/notifications/sync-user-types'
 
 const MAX_PAGES = 1000
 const UPSERT_BATCH_SIZE = 500
@@ -32,17 +37,6 @@ interface UsersApiPage {
   data?: UsersApiUser[]
 }
 
-function isErrorStatus(status: unknown): boolean {
-  if (status === undefined || status === null) return false
-  return !(
-    status === 'success' ||
-    status === 'ok' ||
-    status === true ||
-    status === 1 ||
-    status === 200
-  )
-}
-
 /**
  * Fetch every page of the Users API. Pagination is driven by the
  * `last_user_id` returned on each page and repeats until `has_more`
@@ -64,10 +58,10 @@ async function fetchAllUsers(): Promise<UsersApiUser[]> {
 
     let res: Response
     try {
-      res = await fetch(USERS_API_URL, {
+      res = await fetch(NIVESHBAY_USERS_API_URL, {
         method: 'POST',
         headers: {
-          'X-API-KEY': USERS_API_KEY,
+          'X-API-KEY': NIVESHBAY_API_KEY,
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: new URLSearchParams({ last_user_id: String(lastUserId) }),
@@ -217,5 +211,49 @@ export async function POST() {
   }
 
   console.log(`[users/sync] done — ${uniqueRows.length} users synchronized`)
-  return NextResponse.json({ synchronized: uniqueRows.length })
+
+  // STEP 3–6 — FCM token backfill. AFTER the upsert, find every user whose
+  // fcm_token is NULL or empty and resolve the latest token from the User
+  // API using the local `mobile`. Users that already have a valid token are
+  // never re-fetched. Failures are logged and never fail the sync — the
+  // upsert above is already committed and is not rolled back.
+  const { data: missingTokenUsers, error: missingTokenQueryError } = await admin
+    .from('users')
+    .select('id, mobile')
+    .or('fcm_token.is.null,fcm_token.eq.')
+
+  if (missingTokenQueryError) {
+    console.error(
+      '[users/sync] failed to find users missing FCM tokens:',
+      missingTokenQueryError.message,
+    )
+  }
+
+  const backfill = await backfillMissingFcmTokens(
+    admin,
+    (missingTokenUsers ?? []) as MissingTokenUser[],
+  )
+
+  console.log(
+    `[users/sync] fcm backfill — checked=${backfill.checkedForFcm} ` +
+      `tokensUpdated=${backfill.tokensUpdated} tokenFetchFailed=${backfill.tokenFetchFailed}`,
+  )
+
+  // STEP 7 — User-type sync. AFTER the FCM backfill, refresh every user's
+  // `category` from the User Type API, matched by `mobile`. Only the
+  // category column is written; failures are logged and never fail the
+  // sync — the upsert and token backfill above are already committed.
+  const userTypes = await syncUserTypes(admin)
+
+  console.log(
+    `[users/sync] user-type sync — checked=${userTypes.typesChecked} ` +
+      `categoriesUpdated=${userTypes.categoriesUpdated} typeFetchFailed=${userTypes.typeFetchFailed}`,
+  )
+
+  return NextResponse.json({
+    success: true,
+    synchronized: uniqueRows.length,
+    ...backfill,
+    ...userTypes,
+  })
 }

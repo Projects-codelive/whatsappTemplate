@@ -6,7 +6,10 @@ import {
   isValidFcmToken,
   sendFcmMessage,
 } from '@/lib/firebase/messaging'
-import { isNotificationCategory } from '@/lib/notifications/categories'
+import {
+  expandNotificationCategory,
+  isNotificationCategory,
+} from '@/lib/notifications/categories'
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -118,12 +121,13 @@ export async function POST(request: Request) {
     const { title, message } = payload
 
     // Resolve recipients. 'selected' scopes by id, 'category' by the
-    // canonical category, 'all' takes every row.
+    // canonical category, 'all' takes every row. The shared expansion
+    // makes "Premium" also reach legacy "Paid" rows.
     let query = supabaseAdmin().from('users').select('id, fcm_token')
     if (payload.target === 'selected') {
       query = query.in('id', payload.userIds)
     } else if (payload.target === 'category') {
-      query = query.eq('category', payload.category)
+      query = query.in('category', expandNotificationCategory(payload.category))
     }
 
     const { data, error: queryError } = await query

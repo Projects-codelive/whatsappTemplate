@@ -5,6 +5,7 @@ import { toast } from 'sonner';
 import { createClient } from '@/lib/supabase/client';
 import { syncUsers } from '@/lib/notifications/sync-users';
 import { sendNotification } from '@/lib/notifications/send-notifications';
+import { expandNotificationCategory } from '@/lib/notifications/categories';
 import type { NotificationPayload, NotificationUser } from '@/types';
 import { UserToolbar } from '@/components/notifications/user-toolbar';
 import { UserTable } from '@/components/notifications/user-table';
@@ -50,7 +51,9 @@ export function NotificationPage() {
         (user.name ?? '').toLowerCase().includes(query) ||
         (user.mobile ?? '').toLowerCase().includes(query) ||
         (user.email ?? '').toLowerCase().includes(query);
-      const matchesCategory = category === 'all' || user.category === category;
+      const matchesCategory =
+        category === 'all' ||
+        expandNotificationCategory(category).includes(user.category ?? '');
       return matchesSearch && matchesCategory;
     });
   }, [users, search, category]);
@@ -87,9 +90,20 @@ export function NotificationPage() {
   async function handleSync() {
     setSyncing(true);
     try {
-      await syncUsers();
+      const result = await syncUsers();
       await fetchUsers();
-      toast.success('Users synchronized successfully.');
+      const summary = [`Users synchronized: ${result.synchronized}`];
+      if (result.checkedForFcm > 0) {
+        summary.push(
+          `tokens updated: ${result.tokensUpdated}, token fetches failed: ${result.tokenFetchFailed}`,
+        );
+      }
+      if (result.typesChecked > 0) {
+        summary.push(
+          `categories updated: ${result.categoriesUpdated}, type fetches failed: ${result.typeFetchFailed}`,
+        );
+      }
+      toast.success(summary.length > 1 ? `${summary.join(' — ')}.` : 'Users synchronized successfully.');
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Failed to synchronize users');
     } finally {
