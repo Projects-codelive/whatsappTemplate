@@ -1,6 +1,6 @@
 'use client';
 
-import { RefreshCw, Search, Send } from 'lucide-react';
+import { RefreshCw, Search, Send, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -20,6 +20,11 @@ interface UserToolbarProps {
   syncing: boolean;
   onSyncClick: () => void;
   onSendClick: () => void;
+  totalCount: number;
+  filteredCount: number;
+  selectedCount: number;
+  hasActiveFilters: boolean;
+  onClearFilters: () => void;
 }
 
 export function UserToolbar({
@@ -30,7 +35,14 @@ export function UserToolbar({
   syncing,
   onSyncClick,
   onSendClick,
+  totalCount,
+  filteredCount,
+  selectedCount,
+  hasActiveFilters,
+  onClearFilters,
 }: UserToolbarProps) {
+  const searchActive = search.trim() !== '';
+
   return (
     <div className="flex flex-wrap items-center gap-2">
       <div className="relative min-w-0 flex-1 basis-64">
@@ -40,9 +52,26 @@ export function UserToolbar({
           placeholder="Search user by name, mobile, or email..."
           value={search}
           onChange={(e) => onSearchChange(e.target.value)}
-          className="bg-slate-900 pl-8 text-white placeholder:text-slate-500"
+          className={`bg-slate-900 text-white placeholder:text-slate-500 ${searchActive ? 'pr-8' : ''}`}
         />
+        {searchActive && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={() => onSearchChange('')}
+            aria-label="Clear search"
+            className="absolute top-1/2 right-1.5 -translate-y-1/2 text-slate-400 hover:text-white"
+          >
+            <X className="size-3.5" />
+          </Button>
+        )}
       </div>
+
+      <span className="text-xs text-slate-500" aria-live="polite">
+        {hasActiveFilters
+          ? `${filteredCount} of ${totalCount} user${totalCount === 1 ? '' : 's'}`
+          : `${totalCount} user${totalCount === 1 ? '' : 's'}`}
+      </span>
 
       <Select value={category} onValueChange={(val) => onCategoryChange(val ?? 'all')}>
         <SelectTrigger className="w-fit bg-slate-900 text-slate-200">
@@ -60,6 +89,17 @@ export function UserToolbar({
         </SelectContent>
       </Select>
 
+      {hasActiveFilters && (
+        <Button
+          variant="outline"
+          onClick={onClearFilters}
+          className="border-slate-700 text-slate-300 hover:bg-slate-800"
+        >
+          <X className="size-4" />
+          Clear filters
+        </Button>
+      )}
+
       <Button
         variant="outline"
         onClick={onSyncClick}
@@ -67,7 +107,7 @@ export function UserToolbar({
         className="border-slate-700 text-slate-300 hover:bg-slate-800"
       >
         <RefreshCw className={`size-4 ${syncing ? 'animate-spin' : ''}`} />
-        {syncing ? 'Syncing...' : 'Sync Users'}
+        {syncing ? 'Syncing users...' : 'Sync Users'}
       </Button>
 
       <Button
@@ -77,6 +117,7 @@ export function UserToolbar({
       >
         <Send className="size-4" />
         Send Notification
+        {selectedCount > 0 && <span className="ml-1 rounded-full bg-white/20 px-1.5 text-xs">{selectedCount}</span>}
       </Button>
     </div>
   );

@@ -30,6 +30,30 @@ export const NOTIFICATION_CATEGORY_ALIASES: Record<string, NotificationCategory>
   'day pass': 'Day Pass',
 };
 
+/**
+ * Maps an API `user_type` value to its canonical category. Trims the value,
+ * then normalizes known values through `NOTIFICATION_CATEGORY_ALIASES`
+ * ("free expired" → "Free Expired"). Unknown values keep the legacy
+ * capitalize-first-letter behaviour so no data is lost on re-sync. Returns
+ * null for blank values.
+ *
+ * Both the users.php import and the user_type.php refresh write
+ * `users.category` through this, so every stored value is canonical and the
+ * Premium/Paid expansion (see `expandNotificationCategory`) always sees the
+ * casing it expects.
+ */
+export function normalizeCategory(value: string | null | undefined): string | null {
+  const trimmed = (value ?? '').trim()
+  if (!trimmed) return null
+  // Map known user_type values to their canonical category ("free expired"
+  // → "Free Expired"). Unknown values keep the legacy capitalize-first-
+  // letter behaviour so no data is lost on re-sync.
+  return (
+    NOTIFICATION_CATEGORY_ALIASES[trimmed.toLowerCase()] ??
+    (trimmed.charAt(0).toUpperCase() + trimmed.slice(1))
+  )
+}
+
 export function isNotificationCategory(value: string): value is NotificationCategory {
   return (NOTIFICATION_CATEGORIES as readonly string[]).includes(value);
 }

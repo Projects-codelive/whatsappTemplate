@@ -251,7 +251,7 @@ describe('syncUserTypes', () => {
     expect(result).toEqual({ typesChecked: 0, categoriesUpdated: 0, typeFetchFailed: 1 })
   })
 
-  it('updates only the category column and stores the value exactly as received', async () => {
+  it('updates only the category column and stores the normalized canonical value', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () =>
@@ -284,10 +284,65 @@ describe('syncUserTypes', () => {
     await syncUserTypes(admin)
 
     expect(patches).toEqual([
-      { category: 'paid' },
+      { category: 'Paid' },
       { category: 'Day Pass' },
       { category: 'Free Expired' },
     ])
+  })
+
+  it('normalizes every known user_type to its canonical category', async () => {
+    const cases: Array<{ raw: string; canonical: string }> = [
+      { raw: 'premium', canonical: 'Premium' },
+      { raw: 'Premium', canonical: 'Premium' },
+      { raw: 'paid', canonical: 'Paid' },
+      { raw: 'Paid', canonical: 'Paid' },
+      { raw: 'free', canonical: 'Free' },
+      { raw: 'free expired', canonical: 'Free Expired' },
+      { raw: 'day pass', canonical: 'Day Pass' },
+      { raw: 'premium expired', canonical: 'Premium Expired' },
+      { raw: 'no trader', canonical: 'No Trader' },
+    ]
+
+    const records = cases.map(({ raw }, i) => ({ number: `${i + 1}00`, user_type: raw }))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ status: true, data: records })),
+    )
+
+    const { admin, updates } = fakeAdmin(
+      cases.map((_, i) => ({ mobile: `${i + 1}00` })),
+    )
+
+    const result = await syncUserTypes(admin)
+
+    const expectedUpdates: Record<string, string> = {}
+    cases.forEach(({ canonical }, i) => {
+      expectedUpdates[`${i + 1}00`] = canonical
+    })
+    expect(updates).toEqual(expectedUpdates)
+    expect(result).toEqual({
+      typesChecked: cases.length,
+      categoriesUpdated: cases.length,
+      typeFetchFailed: 0,
+    })
+  })
+
+  it('preserves the existing normalization behaviour for unknown user_type values', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse({
+          status: true,
+          data: [{ number: '111', user_type: 'platinum' }],
+        }),
+      ),
+    )
+
+    const { admin, updates } = fakeAdmin([{ mobile: '111' }])
+
+    await syncUserTypes(admin)
+
+    expect(updates).toEqual({ 111: 'Platinum' })
   })
 
   it('counts a Supabase update error as failed', async () => {

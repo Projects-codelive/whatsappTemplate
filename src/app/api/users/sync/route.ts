@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createHash } from 'node:crypto'
 import { supabaseAdmin } from '@/lib/automations/admin-client'
-import { NOTIFICATION_CATEGORY_ALIASES } from '@/lib/notifications/categories'
+import { normalizeCategory } from '@/lib/notifications/categories'
 import {
   isErrorStatus,
   NIVESHBAY_API_KEY,
@@ -125,18 +125,6 @@ function buildUserId(user: UsersApiUser): string {
   if (phone) return `phone:${phone}`
 
   return `user:${createHash('sha1').update(JSON.stringify(user)).digest('hex')}`
-}
-
-function normalizeCategory(value: string | null | undefined): string | null {
-  const trimmed = (value ?? '').trim()
-  if (!trimmed) return null
-  // Map known user_type values to their canonical category ("free expired"
-  // → "Free Expired"). Unknown values keep the legacy capitalize-first-
-  // letter behaviour so no data is lost on re-sync.
-  return (
-    NOTIFICATION_CATEGORY_ALIASES[trimmed.toLowerCase()] ??
-    (trimmed.charAt(0).toUpperCase() + trimmed.slice(1))
-  )
 }
 
 function toIso(value: string | null | undefined): string | null {

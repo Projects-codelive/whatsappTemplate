@@ -28,6 +28,7 @@ import {
 } from '@/components/ui/select';
 import type { NotificationPayload, NotificationTarget } from '@/types';
 import { NOTIFICATION_CATEGORIES } from '@/lib/notifications/categories';
+import { describeSendTarget } from '@/lib/notifications/user-list';
 
 const TARGET_OPTIONS: { value: NotificationTarget; label: string }[] = [
   { value: 'selected', label: 'Selected Users' },
@@ -117,6 +118,12 @@ export function SendNotificationModal({
     }
   }
 
+  const confirmation = describeSendTarget({
+    target,
+    selectedCount: selectedUserIds.length,
+    category: target === 'category' ? category : null,
+  });
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="bg-slate-900 border-slate-700 sm:max-w-lg">
@@ -145,6 +152,9 @@ export function SendNotificationModal({
                 </label>
               ))}
             </RadioGroup>
+            <p className="text-xs text-slate-400" aria-live="polite">
+              {confirmation}
+            </p>
           </div>
 
           {target === 'category' && (
@@ -192,6 +202,23 @@ export function SendNotificationModal({
               rows={4}
               className="bg-slate-800 border-slate-700 text-white placeholder:text-slate-500 resize-none"
             />
+          </div>
+
+          <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-3">
+            <p className="text-xs font-medium tracking-wide text-slate-400 uppercase">
+              Preview
+            </p>
+            <p className="mt-1 text-sm font-semibold text-white">
+              {title.trim() || <span className="font-normal text-slate-500 italic">Notification title</span>}
+            </p>
+            <p className="mt-0.5 text-sm text-slate-300">
+              {message.trim() || <span className="italic text-slate-500">Notification message preview.</span>}
+            </p>
+          </div>
+
+          <div className="flex items-center justify-between text-xs text-slate-500">
+            <span>Title: {title.length} characters</span>
+            <span>Message: {message.length} characters</span>
           </div>
         </div>
 

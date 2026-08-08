@@ -1,8 +1,15 @@
 'use client';
 
-import { Loader2, SearchX, Users } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Loader2, SearchX, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import {
   Table,
   TableBody,
@@ -11,6 +18,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { PAGE_SIZE_OPTIONS } from '@/lib/notifications/user-list';
 import type { NotificationUser } from '@/types';
 
 function formatDate(value: string | null): string {
@@ -60,9 +68,21 @@ export function UserRow({ user, selected, onToggle }: UserRowProps) {
   );
 }
 
+export interface UserTablePagination {
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  startIndex: number;
+  endIndex: number;
+  onPageChange: (page: number) => void;
+  onPageSizeChange: (pageSize: number) => void;
+}
+
 interface UserTableProps {
   users: NotificationUser[];
   loading: boolean;
+  /** Filtered-row count (not the current page) — drives the empty state. */
+  totalFiltered: number;
   selectedIds: Set<string>;
   allSelected: boolean;
   someSelected: boolean;
@@ -70,11 +90,13 @@ interface UserTableProps {
   onToggleAll: (checked: boolean) => void;
   hasFilters: boolean;
   onClearFilters: () => void;
+  pagination: UserTablePagination;
 }
 
 export function UserTable({
   users,
   loading,
+  totalFiltered,
   selectedIds,
   allSelected,
   someSelected,
@@ -82,16 +104,21 @@ export function UserTable({
   onToggleAll,
   hasFilters,
   onClearFilters,
+  pagination,
 }: UserTableProps) {
   if (loading) {
     return (
-      <div className="flex h-64 items-center justify-center rounded-xl border border-slate-800 bg-slate-900">
+      <div
+        className="flex h-64 items-center justify-center gap-2 rounded-xl border border-slate-800 bg-slate-900"
+        aria-live="polite"
+      >
         <Loader2 className="size-6 animate-spin text-primary" />
+        <span className="text-sm text-slate-400">Loading users...</span>
       </div>
     );
   }
 
-  if (users.length === 0) {
+  if (totalFiltered === 0) {
     return (
       <div className="flex h-64 flex-col items-center justify-center rounded-xl border border-slate-800 bg-slate-900">
         {hasFilters ? (
@@ -122,38 +149,93 @@ export function UserTable({
     );
   }
 
+  const { page, pageSize, totalPages, startIndex, endIndex } = pagination;
+  const canGoBack = page > 1;
+  const canGoForward = page < totalPages;
+
   return (
-    <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-900">
-      <Table>
-        <TableHeader>
-          <TableRow className="border-slate-800 hover:bg-transparent">
-            <TableHead className="w-10 text-slate-400">
-              <Checkbox
-                checked={allSelected}
-                indeterminate={someSelected && !allSelected}
-                onCheckedChange={onToggleAll}
-                aria-label="Select all users"
+    <div className="rounded-xl border border-slate-800 bg-slate-900">
+      <div className="overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow className="border-slate-800 hover:bg-transparent">
+              <TableHead className="w-10 text-slate-400">
+                <Checkbox
+                  checked={allSelected}
+                  indeterminate={someSelected && !allSelected}
+                  onCheckedChange={onToggleAll}
+                  aria-label="Select all users on this page"
+                />
+              </TableHead>
+              <TableHead className="text-slate-400">Name</TableHead>
+              <TableHead className="text-slate-400">Mobile</TableHead>
+              <TableHead className="hidden text-slate-400 md:table-cell">Email</TableHead>
+              <TableHead className="hidden text-slate-400 sm:table-cell">Category</TableHead>
+              <TableHead className="hidden text-slate-400 lg:table-cell">Joined Date</TableHead>
+              <TableHead className="hidden text-slate-400 lg:table-cell">Created Date</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {users.map((user) => (
+              <UserRow
+                key={user.id}
+                user={user}
+                selected={selectedIds.has(user.id)}
+                onToggle={(checked) => onToggle(user.id, checked)}
               />
-            </TableHead>
-            <TableHead className="text-slate-400">Name</TableHead>
-            <TableHead className="text-slate-400">Mobile</TableHead>
-            <TableHead className="hidden text-slate-400 md:table-cell">Email</TableHead>
-            <TableHead className="hidden text-slate-400 sm:table-cell">Category</TableHead>
-            <TableHead className="hidden text-slate-400 lg:table-cell">Joined Date</TableHead>
-            <TableHead className="hidden text-slate-400 lg:table-cell">Created Date</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {users.map((user) => (
-            <UserRow
-              key={user.id}
-              user={user}
-              selected={selectedIds.has(user.id)}
-              onToggle={(checked) => onToggle(user.id, checked)}
-            />
-          ))}
-        </TableBody>
-      </Table>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 border-t border-slate-800 px-4 py-3">
+        <span className="text-xs text-slate-400">
+          Showing {totalFiltered === 0 ? 0 : startIndex + 1}–{endIndex} of {totalFiltered}
+        </span>
+
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <Select
+            value={String(pageSize)}
+            onValueChange={(val) => pagination.onPageSizeChange(Number(val))}
+          >
+            <SelectTrigger size="sm" className="w-fit bg-slate-800 text-slate-200">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent className="bg-slate-800 text-slate-200">
+              {PAGE_SIZE_OPTIONS.map((size) => (
+                <SelectItem key={size} value={String(size)} className="focus:bg-slate-700 focus:text-white">
+                  {size} per page
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <span className="text-xs text-slate-400">
+            Page {page} of {totalPages}
+          </span>
+
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={() => pagination.onPageChange(page - 1)}
+            disabled={!canGoBack}
+            aria-label="Previous page"
+            className="border-slate-700 text-slate-300 hover:bg-slate-800"
+          >
+            <ChevronLeft className="size-4" />
+          </Button>
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={() => pagination.onPageChange(page + 1)}
+            disabled={!canGoForward}
+            aria-label="Next page"
+            className="border-slate-700 text-slate-300 hover:bg-slate-800"
+          >
+            <ChevronRight className="size-4" />
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }

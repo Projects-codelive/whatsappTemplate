@@ -1,4 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { normalizeCategory } from './categories'
 import {
   isErrorStatus,
   NIVESHBAY_API_KEY,
@@ -11,8 +12,9 @@ import {
  * Runs AFTER the Users API sync and the FCM-token backfill. The User Type
  * API (user_type.php) returns every user's current `user_type`; each record
  * is matched to a local user by `mobile` and ONLY the `category` column is
- * updated. Values are stored exactly as the API returns them — unlike the
- * users.php import there is no alias normalisation here.
+ * updated. Values are normalized through the same canonical category mapping
+ * the users.php import uses (see `normalizeCategory`), so the database never
+ * sees the raw API casing ("paid" → "Paid", "free expired" → "Free Expired").
  *
  * Failures never abort the sync: page-level errors (timeout, network,
  * HTTP, status=false, bad JSON) are logged and stop further paging,
@@ -140,8 +142,8 @@ async function fetchAllUserTypes(): Promise<{
 
 /**
  * Applies a single record: matched by `mobile`, updates ONLY `category`
- * with the exact value the API returned. Returns false (without logging)
- * when the number simply has no local match.
+ * with the canonical normalization of the API's `user_type`. Returns false
+ * (without logging) when the number simply has no local match.
  */
 async function applyUserType(
   admin: Pick<SupabaseClient, 'from'>,
@@ -164,9 +166,20 @@ async function applyUserType(
     return false
   }
 
+  // Normalize through the shared canonical mapping so the database stores
+  // the same canonical values the users.php import writes ("paid" → "Paid",
+  // "free expired" → "Free Expired").
+  const category = normalizeCategory(userType)
+  if (!category) {
+    console.warn(
+      `[users/sync] user-type record for number=${number} has no usable user_type — skipped`,
+    )
+    return false
+  }
+
   const { error } = await admin
     .from('users')
-    .update({ category: userType })
+    .update({ category })
     .eq('mobile', number)
   if (error) {
     console.error(
@@ -175,7 +188,7 @@ async function applyUserType(
     return false
   }
 
-  console.log(`[users/sync] updated category for number=${number} → ${userType}`)
+  console.log(`[users/sync] updated category for number=${number} → ${category}`)
   return true
 }
 

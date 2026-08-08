@@ -5,11 +5,21 @@ import { toast } from 'sonner';
 import { createClient } from '@/lib/supabase/client';
 import { syncUsers } from '@/lib/notifications/sync-users';
 import { sendNotification } from '@/lib/notifications/send-notifications';
-import { expandNotificationCategory } from '@/lib/notifications/categories';
+import {
+  DEFAULT_PAGE_SIZE,
+  filterUsers,
+  hasActiveFilters,
+  paginateUsers,
+  summarizeSyncResult,
+  summarizeUsers,
+  toggleIds,
+} from '@/lib/notifications/user-list';
 import type { NotificationPayload, NotificationUser } from '@/types';
 import { UserToolbar } from '@/components/notifications/user-toolbar';
 import { UserTable } from '@/components/notifications/user-table';
 import { SendNotificationModal } from '@/components/notifications/send-notification-modal';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 
 export function NotificationPage() {
   const supabase = createClient();
@@ -19,6 +29,8 @@ export function NotificationPage() {
   const [syncing, setSyncing] = useState(false);
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState('all');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [modalOpen, setModalOpen] = useState(false);
 
@@ -43,48 +55,50 @@ export function NotificationPage() {
     fetchUsers();
   }, [fetchUsers]);
 
-  const filtered = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return users.filter((user) => {
-      const matchesSearch =
-        query === '' ||
-        (user.name ?? '').toLowerCase().includes(query) ||
-        (user.mobile ?? '').toLowerCase().includes(query) ||
-        (user.email ?? '').toLowerCase().includes(query);
-      const matchesCategory =
-        category === 'all' ||
-        expandNotificationCategory(category).includes(user.category ?? '');
-      return matchesSearch && matchesCategory;
-    });
-  }, [users, search, category]);
+  // Changing the filter or page size restarts from the first page.
+  useEffect(() => {
+    setPage(1);
+  }, [search, category, pageSize]);
+
+  const filtered = useMemo(
+    () => filterUsers(users, { search, category }),
+    [users, search, category],
+  );
+
+  const paginated = useMemo(
+    () => paginateUsers(filtered, page, pageSize),
+    [filtered, page, pageSize],
+  );
 
   const filteredIds = useMemo(() => filtered.map((user) => user.id), [filtered]);
+  const pageIds = useMemo(() => paginated.items.map((user) => user.id), [paginated.items]);
 
-  const allSelected = filteredIds.length > 0 && filteredIds.every((id) => selectedIds.has(id));
-  const someSelected = filteredIds.some((id) => selectedIds.has(id));
+  const summary = useMemo(
+    () => summarizeUsers(filtered, selectedIds),
+    [filtered, selectedIds],
+  );
+
+  const filtersActive = hasActiveFilters({ search, category });
+
+  const pageAllSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.has(id));
+  const pageSomeSelected = pageIds.some((id) => selectedIds.has(id));
+  const allFilteredSelected =
+    filteredIds.length > 0 && filteredIds.every((id) => selectedIds.has(id));
 
   function handleToggleAll(checked: boolean) {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (checked) {
-        filteredIds.forEach((id) => next.add(id));
-      } else {
-        filteredIds.forEach((id) => next.delete(id));
-      }
-      return next;
-    });
+    setSelectedIds((prev) => toggleIds(prev, pageIds, checked));
   }
 
   function handleToggleUser(id: string, checked: boolean) {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (checked) {
-        next.add(id);
-      } else {
-        next.delete(id);
-      }
-      return next;
-    });
+    setSelectedIds((prev) => toggleIds(prev, [id], checked));
+  }
+
+  function handleSelectAllFiltered() {
+    setSelectedIds((prev) => toggleIds(prev, filteredIds, true));
+  }
+
+  function handleClearSelection() {
+    setSelectedIds(new Set());
   }
 
   async function handleSync() {
@@ -92,18 +106,7 @@ export function NotificationPage() {
     try {
       const result = await syncUsers();
       await fetchUsers();
-      const summary = [`Users synchronized: ${result.synchronized}`];
-      if (result.checkedForFcm > 0) {
-        summary.push(
-          `tokens updated: ${result.tokensUpdated}, token fetches failed: ${result.tokenFetchFailed}`,
-        );
-      }
-      if (result.typesChecked > 0) {
-        summary.push(
-          `categories updated: ${result.categoriesUpdated}, type fetches failed: ${result.typeFetchFailed}`,
-        );
-      }
-      toast.success(summary.length > 1 ? `${summary.join(' — ')}.` : 'Users synchronized successfully.');
+      toast.success(summarizeSyncResult(result));
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Failed to synchronize users');
     } finally {
@@ -119,11 +122,15 @@ export function NotificationPage() {
   async function handleSend(payload: NotificationPayload) {
     try {
       const result = await sendNotification(payload);
-      toast.success(
-        result.failed > 0
-          ? `Notification sent: ${result.sent} delivered, ${result.failed} failed`
-          : `Notification sent to ${result.sent} user${result.sent === 1 ? '' : 's'}.`,
-      );
+      if (result.failed > 0) {
+        toast.success(
+          `Accepted by Firebase: ${result.sent} sent, ${result.failed} failed`,
+        );
+      } else {
+        toast.success(
+          `Sent successfully to ${result.sent} user${result.sent === 1 ? '' : 's'}.`,
+        );
+      }
       if (result.failedUsers.length > 0) {
         toast.error(
           `Failed for ${result.failedUsers.length} user(s): ${result.failedUsers.join(', ')}`,
@@ -134,8 +141,6 @@ export function NotificationPage() {
       throw error;
     }
   }
-
-  const hasFilters = search.trim() !== '' || category !== 'all';
 
   return (
     <div className="space-y-6">
@@ -154,18 +159,76 @@ export function NotificationPage() {
         syncing={syncing}
         onSyncClick={handleSync}
         onSendClick={() => setModalOpen(true)}
+        totalCount={users.length}
+        filteredCount={filtered.length}
+        selectedCount={summary.selected}
+        hasActiveFilters={filtersActive}
+        onClearFilters={handleClearFilters}
       />
 
+      <div className="flex flex-wrap items-center gap-2" aria-label="User summary">
+        <Badge variant="secondary">Total: {users.length}</Badge>
+        <Badge variant="secondary">Filtered: {filtered.length}</Badge>
+        <Badge variant="secondary">Selected: {summary.selected}</Badge>
+        <Badge variant="secondary">FCM Ready: {summary.fcmReady}</Badge>
+        <Badge variant="secondary">Missing FCM: {summary.missingFcm}</Badge>
+      </div>
+
+      {summary.selected > 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-800 bg-slate-900 px-3 py-2">
+          <span className="text-sm text-slate-300">
+            {summary.selected} user{summary.selected === 1 ? '' : 's'} selected
+          </span>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            {allFilteredSelected ? (
+              <span className="text-xs text-emerald-400">
+                All {filtered.length} filtered users selected
+              </span>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleSelectAllFiltered}
+                className="border-slate-700 text-slate-300 hover:bg-slate-800"
+              >
+                Select all {filtered.length} filtered users
+              </Button>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleClearSelection}
+              className="border-slate-700 text-slate-300 hover:bg-slate-800"
+            >
+              Clear selection
+            </Button>
+            <Button size="sm" onClick={() => setModalOpen(true)}>
+              Send to {summary.selected}
+            </Button>
+          </div>
+        </div>
+      )}
+
       <UserTable
-        users={filtered}
+        users={paginated.items}
         loading={loading}
+        totalFiltered={filtered.length}
         selectedIds={selectedIds}
-        allSelected={allSelected}
-        someSelected={someSelected}
+        allSelected={pageAllSelected}
+        someSelected={pageSomeSelected}
         onToggle={handleToggleUser}
         onToggleAll={handleToggleAll}
-        hasFilters={hasFilters}
+        hasFilters={filtersActive}
         onClearFilters={handleClearFilters}
+        pagination={{
+          page: paginated.page,
+          pageSize: paginated.pageSize,
+          totalPages: paginated.totalPages,
+          startIndex: paginated.startIndex,
+          endIndex: paginated.endIndex,
+          onPageChange: setPage,
+          onPageSizeChange: setPageSize,
+        }}
       />
 
       <SendNotificationModal
