@@ -38,7 +38,7 @@ yarn-error.log*
 .env*.local
 
 # Firebase (never commit secrets)
-firebase/
+/firebase/
 **/*firebase-adminsdk.json
 
 # vercel
