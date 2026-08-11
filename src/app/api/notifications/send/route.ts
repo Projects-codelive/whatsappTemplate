@@ -7,15 +7,15 @@ import {
   sendFcmMessage,
 } from '@/lib/firebase/messaging'
 import {
-  expandNotificationCategory,
-  isNotificationCategory,
-} from '@/lib/notifications/categories'
+  validateSendRequest,
+  type SendNotificationRequestBody,
+} from '@/lib/notifications/validate-send-request'
+import { resolveRecipientScope } from '@/lib/notifications/recipient-scope'
 import {
   checkRateLimit,
   rateLimitResponse,
   RATE_LIMITS,
 } from '@/lib/rate-limit'
-import type { NotificationPayload } from '@/types'
 
 /**
  * Push-notification dispatch. The browser only ever talks to this route —
@@ -28,62 +28,9 @@ import type { NotificationPayload } from '@/types'
 
 const SEND_CHUNK_SIZE = 10
 
-interface SendNotificationRequestBody {
-  target?: unknown
-  userIds?: unknown
-  category?: unknown
-  title?: unknown
-  message?: unknown
-}
-
 interface UserTokenRow {
   id: string
   fcm_token: string | null
-}
-
-type ValidationResult =
-  | { ok: true; payload: NotificationPayload }
-  | { ok: false; error: string; status: number }
-
-function validateSendRequest(body: SendNotificationRequestBody): ValidationResult {
-  const title = typeof body.title === 'string' ? body.title.trim() : ''
-  const message = typeof body.message === 'string' ? body.message.trim() : ''
-
-  if (!title) {
-    return { ok: false, error: 'Notification title is required', status: 400 }
-  }
-  if (!message) {
-    return { ok: false, error: 'Notification message is required', status: 400 }
-  }
-
-  if (body.target === 'selected') {
-    const userIds = Array.isArray(body.userIds)
-      ? body.userIds.filter(
-          (id): id is string => typeof id === 'string' && id.length > 0,
-        )
-      : []
-    if (userIds.length === 0) {
-      return { ok: false, error: 'Select at least one user', status: 400 }
-    }
-    return { ok: true, payload: { target: 'selected', userIds, title, message } }
-  }
-
-  if (body.target === 'all') {
-    return { ok: true, payload: { target: 'all', title, message } }
-  }
-
-  if (body.target === 'category') {
-    const category = typeof body.category === 'string' ? body.category.trim() : ''
-    if (!category) {
-      return { ok: false, error: 'Select a category', status: 400 }
-    }
-    if (!isNotificationCategory(category)) {
-      return { ok: false, error: 'Invalid notification category', status: 400 }
-    }
-    return { ok: true, payload: { target: 'category', category, title, message } }
-  }
-
-  return { ok: false, error: 'Invalid notification target', status: 400 }
 }
 
 export async function POST(request: Request) {
@@ -118,16 +65,16 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: validation.error }, { status: validation.status })
     }
     const { payload } = validation
-    const { title, message } = payload
+    const { title, message, imageUrl } = payload
 
-    // Resolve recipients. 'selected' scopes by id, 'category' by the
-    // canonical category, 'all' takes every row. The shared expansion
-    // makes "Premium" also reach legacy "Paid" rows.
+    // Resolve recipients. The shared scope mirrors the recipient-count
+    // endpoint, so the count the UI showed is always the set sent here —
+    // 'selected' scopes by id, 'category' by the canonical category
+    // (Premium also reaches legacy "Paid" rows), 'all' takes every row.
+    const scope = resolveRecipientScope(payload)
     let query = supabaseAdmin().from('users').select('id, fcm_token')
-    if (payload.target === 'selected') {
-      query = query.in('id', payload.userIds)
-    } else if (payload.target === 'category') {
-      query = query.in('category', expandNotificationCategory(payload.category))
+    if (scope.column) {
+      query = query.in(scope.column, scope.values)
     }
 
     const { data, error: queryError } = await query
@@ -182,7 +129,13 @@ export async function POST(request: Request) {
       const chunk = recipients.slice(i, i + SEND_CHUNK_SIZE)
       const outcomes = await Promise.allSettled(
         chunk.map((user) =>
-          sendFcmMessage({ accessToken, token: user.fcm_token, title, body: message }),
+          sendFcmMessage({
+            accessToken,
+            token: user.fcm_token,
+            title,
+            body: message,
+            image: imageUrl,
+          }),
         ),
       )
       outcomes.forEach((outcome, index) => {

@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { Loader2 } from 'lucide-react';
+import { ImagePlus, Loader2, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -26,9 +26,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { useAuth } from '@/hooks/use-auth';
 import type { NotificationPayload, NotificationTarget } from '@/types';
 import { NOTIFICATION_CATEGORIES } from '@/lib/notifications/categories';
 import { describeSendTarget } from '@/lib/notifications/user-list';
+import { getRecipientCount } from '@/lib/notifications/recipient-count';
+import { validateNotificationImage } from '@/lib/notifications/notification-image';
+import { uploadNotificationImage } from '@/lib/notifications/image-upload';
 
 const TARGET_OPTIONS: { value: NotificationTarget; label: string }[] = [
   { value: 'selected', label: 'Selected Users' },
@@ -49,17 +53,103 @@ export function SendNotificationModal({
   selectedUserIds,
   onSend,
 }: SendNotificationModalProps) {
+  const { user } = useAuth();
   const [target, setTarget] = useState<NotificationTarget>('selected');
   const [category, setCategory] = useState('');
   const [title, setTitle] = useState('');
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
 
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [count, setCount] = useState<number | null>(null);
+  const [countLoading, setCountLoading] = useState(false);
+  const [countError, setCountError] = useState(false);
+
+  // Revoke the preview object URL when it is replaced or the modal unmounts.
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    };
+  }, [previewUrl]);
+
+  // Fetch the server-side recipient count for the current target. The
+  // endpoint resolves exactly the same scope as the send route, so the
+  // number shown always matches the set that will actually be sent. Runs
+  // only while the modal is open, and refetches whenever the target,
+  // category, or selection changes.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+
+    async function loadCount() {
+      if (target === 'selected' && selectedUserIds.length === 0) {
+        setCount(0);
+        setCountError(false);
+        setCountLoading(false);
+        return;
+      }
+      if (target === 'category' && !category) {
+        setCount(null);
+        setCountError(false);
+        setCountLoading(false);
+        return;
+      }
+
+      setCountLoading(true);
+      setCountError(false);
+      try {
+        const result = await getRecipientCount(
+          target === 'selected'
+            ? { target: 'selected', userIds: selectedUserIds }
+            : target === 'all'
+              ? { target: 'all' }
+              : { target: 'category', category },
+        );
+        if (!cancelled) {
+          setCount(result);
+        }
+      } catch {
+        if (!cancelled) setCountError(true);
+      } finally {
+        if (!cancelled) setCountLoading(false);
+      }
+    }
+
+    void loadCount();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, target, category, selectedUserIds]);
+
   function handleTargetChange(value: NotificationTarget) {
     setTarget(value);
     if (value === 'category' && !category && NOTIFICATION_CATEGORIES.length > 0) {
       setCategory(NOTIFICATION_CATEGORIES[0]);
     }
+  }
+
+  function handlePickImage(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // reset so the same file can be re-picked
+    if (!file) return;
+
+    const validation = validateNotificationImage(file);
+    if (!validation.ok) {
+      toast.error('Invalid image', { description: validation.error });
+      return;
+    }
+
+    setImageFile(file);
+    setPreviewUrl(URL.createObjectURL(file));
+  }
+
+  function handleRemoveImage() {
+    setImageFile(null);
+    setPreviewUrl(null);
   }
 
   async function handleSend() {
@@ -105,11 +195,31 @@ export function SendNotificationModal({
 
     setSending(true);
     try {
-      await onSend(payload);
+      let imageUrl: string | undefined;
+      if (imageFile) {
+        if (!user) {
+          toast.error('You must be signed in to upload an image');
+          return;
+        }
+        try {
+          imageUrl = await uploadNotificationImage(imageFile, user.id);
+        } catch (uploadError) {
+          toast.error(
+            uploadError instanceof Error
+              ? uploadError.message
+              : 'Image upload failed',
+          );
+          return;
+        }
+      }
+
+      await onSend(imageUrl ? { ...payload, imageUrl } : payload);
       setTitle('');
       setMessage('');
       setTarget('selected');
       setCategory('');
+      setImageFile(null);
+      setPreviewUrl(null);
       onOpenChange(false);
     } catch {
       // Keep the modal open — the page already toasted the error.
@@ -124,17 +234,22 @@ export function SendNotificationModal({
     category: target === 'category' ? category : null,
   });
 
+  const countText =
+    count !== null
+      ? `Recipients: ${count} user${count === 1 ? '' : 's'}`
+      : null;
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="bg-slate-900 border-slate-700 sm:max-w-lg">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[90vh] flex-col overflow-hidden bg-slate-900 border-slate-700 sm:max-w-lg">
+        <DialogHeader className="shrink-0">
           <DialogTitle className="text-white">Send Notification</DialogTitle>
           <DialogDescription className="text-slate-400">
             Choose who receives this push notification.
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4 py-2">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto py-2 pr-1">
           <div className="space-y-2">
             <Label className="text-slate-300">Notification Target</Label>
             <RadioGroup
@@ -152,9 +267,24 @@ export function SendNotificationModal({
                 </label>
               ))}
             </RadioGroup>
-            <p className="text-xs text-slate-400" aria-live="polite">
-              {confirmation}
-            </p>
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+              <p className="text-xs text-slate-400">{confirmation}</p>
+              {countLoading ? (
+                <p className="text-xs text-slate-400" aria-live="polite">
+                  Recipients: Calculating...
+                </p>
+              ) : countError ? (
+                <p className="text-xs text-amber-400" aria-live="polite">
+                  Recipients: unavailable
+                </p>
+              ) : (
+                countText && (
+                  <p className="text-xs font-medium text-slate-300" aria-live="polite">
+                    {countText}
+                  </p>
+                )
+              )}
+            </div>
           </div>
 
           {target === 'category' && (
@@ -204,6 +334,66 @@ export function SendNotificationModal({
             />
           </div>
 
+          <div className="space-y-2">
+            <Label className="text-slate-300">Image (Optional)</Label>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              className="hidden"
+              onChange={handlePickImage}
+            />
+            {previewUrl && imageFile ? (
+              <div className="flex items-start gap-3 rounded-lg border border-slate-700 bg-slate-800/50 p-3">
+                <img
+                  src={previewUrl}
+                  alt="Notification image preview"
+                  className="h-20 w-20 shrink-0 rounded-md object-cover"
+                />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm text-slate-300">{imageFile.name}</p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={sending}
+                      className="border-slate-700 text-slate-300 hover:bg-slate-800"
+                    >
+                      Replace
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleRemoveImage}
+                      disabled={sending}
+                      className="text-slate-400 hover:text-white"
+                    >
+                      <Trash2 className="size-4" />
+                      Remove
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={sending}
+                className="border-slate-700 text-slate-300 hover:bg-slate-800"
+              >
+                <ImagePlus className="size-4" />
+                Choose image
+              </Button>
+            )}
+            <p className="text-xs text-slate-500">
+              PNG, JPG, or WebP. Up to 2 MB.
+            </p>
+          </div>
+
           <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-3">
             <p className="text-xs font-medium tracking-wide text-slate-400 uppercase">
               Preview
@@ -214,6 +404,13 @@ export function SendNotificationModal({
             <p className="mt-0.5 text-sm text-slate-300">
               {message.trim() || <span className="italic text-slate-500">Notification message preview.</span>}
             </p>
+            {previewUrl && (
+              <img
+                src={previewUrl}
+                alt=""
+                className="mt-2 max-h-24 w-full rounded-md object-cover"
+              />
+            )}
           </div>
 
           <div className="flex items-center justify-between text-xs text-slate-500">
@@ -222,7 +419,7 @@ export function SendNotificationModal({
           </div>
         </div>
 
-        <DialogFooter className="bg-slate-900 border-slate-700">
+        <DialogFooter className="shrink-0 bg-slate-900 border-slate-700">
           <Button
             variant="outline"
             onClick={() => onOpenChange(false)}
@@ -242,7 +439,7 @@ export function SendNotificationModal({
                 Sending...
               </>
             ) : (
-              'Send'
+              'Send Notification'
             )}
           </Button>
         </DialogFooter>

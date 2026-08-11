@@ -433,12 +433,16 @@ export interface SelectedUsersNotificationPayload {
   userIds: string[];
   title: string;
   message: string;
+  /** Optional push image URL. Only sent to FCM when present. */
+  imageUrl?: string;
 }
 
 export interface AllUsersNotificationPayload {
   target: 'all';
   title: string;
   message: string;
+  /** Optional push image URL. Only sent to FCM when present. */
+  imageUrl?: string;
 }
 
 export interface CategoryNotificationPayload {
@@ -446,6 +450,20 @@ export interface CategoryNotificationPayload {
   category: string;
   title: string;
   message: string;
+  /** Optional push image URL. Only sent to FCM when present. */
+  imageUrl?: string;
+}
+
+/** Body for the recipient-count endpoint — same target resolution the
+ *  send route uses, minus the title/message/image fields. */
+export type RecipientCountRequest =
+  | { target: 'selected'; userIds: string[] }
+  | { target: 'all' }
+  | { target: 'category'; category: string };
+
+/** Response of the recipient-count endpoint. */
+export interface RecipientCountResponse {
+  count: number;
 }
 
 export type NotificationPayload =
