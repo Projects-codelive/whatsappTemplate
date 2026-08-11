@@ -20,7 +20,7 @@ function supabaseAdmin() {
   return _adminClient
 }
 
-interface WhatsAppMessage {
+export interface WhatsAppMessage {
   id: string
   from: string
   timestamp: string
@@ -33,6 +33,14 @@ interface WhatsAppMessage {
   sticker?: { id: string; mime_type: string }
   location?: { latitude: number; longitude: number; name?: string; address?: string }
   reaction?: { message_id: string; emoji: string }
+  /**
+   * Present when the customer taps a quick-reply button on a template
+   * message we sent (type === 'button'). This is the template-button
+   * counterpart to `interactive.button_reply` for interactive messages:
+   * `text` is the human-readable label ("Yes"), `payload` is whatever
+   * payload we attached to the button when sending (may be omitted).
+   */
+  button?: { text: string; payload: string }
   /**
    * Set when the customer taps a button or list row on an interactive
    * message we sent. `button_reply.id` / `list_reply.id` is whatever id
@@ -489,7 +497,7 @@ async function handleReaction(
   }
 }
 
-async function processMessage(
+export async function processMessage(
   message: WhatsAppMessage,
   contact: { profile: { name: string }; wa_id: string },
   userId: string,
@@ -696,7 +704,7 @@ async function processMessage(
   }
 }
 
-async function parseMessageContent(
+export async function parseMessageContent(
   message: WhatsAppMessage,
   accessToken: string
 ): Promise<{
@@ -831,6 +839,18 @@ async function parseMessageContent(
         }
       }
       return { ...empty, contentText: '[Interactive reply]' }
+    }
+
+    case 'button': {
+      // The customer tapped a quick-reply button on a template we sent.
+      // Meta delivers this with type='button' and button.text set to the
+      // tapped label ("Yes"/"No"). Normalize it into the existing text
+      // representation — content_type maps to 'text' downstream, so the
+      // Inbox renders it exactly like a typed "Yes"/"No". (Template
+      // buttons carry a payload, not a stable reply id, so we don't
+      // populate interactiveReplyId — that column is reserved for
+      // content_type='interactive' button_reply/list_reply taps.)
+      return { ...empty, contentText: message.button?.text || null }
     }
 
     default:
