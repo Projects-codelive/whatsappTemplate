@@ -91,7 +91,9 @@ export type ContentType =
   | 'video'
   | 'location'
   | 'template'
-  /** Customer tapped a reply button or list row on a message we sent. */
+  /** Customer tapped a reply button or list row on a message we sent —
+   *  covers both interactive button/list taps and template quick-reply
+   *  button taps. */
   | 'interactive';
 export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 

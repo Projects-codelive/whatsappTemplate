@@ -16,7 +16,10 @@ import type {
 } from '@/types'
 import { supabaseAdmin } from './admin-client'
 import { engineSendText, engineSendTemplate } from './meta-send'
-import { orderVariableKeys } from '@/lib/whatsapp/template-variables'
+import {
+  orderVariableKeys,
+  renderTemplateBody,
+} from '@/lib/whatsapp/template-variables'
 
 // ------------------------------------------------------------
 // Public API
@@ -341,6 +344,16 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
             value: String(cfg.variables![k]),
           }))
         : []
+      // Render the body with the resolved values so the Inbox can show the
+      // exact text the customer received. `params` is already in body order
+      // (orderVariableKeys above), so a positional render is correct for
+      // both named and numeric placeholders — same as the manual send
+      // route (message-thread.tsx handleSendTemplate). Without this the
+      // persisted row has content_text=NULL and the template bubble renders
+      // empty, making the original message look missing from the thread.
+      const contentText = bodyText
+        ? renderTemplateBody(bodyText, params.map((p) => p.value))
+        : undefined
       const { whatsapp_message_id } = await engineSendTemplate({
         userId: args.automation.user_id,
         conversationId,
@@ -348,6 +361,7 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
         templateName: cfg.template_name,
         language: cfg.language,
         params,
+        contentText,
       })
       return `template sent via Meta (${whatsapp_message_id})`
     }

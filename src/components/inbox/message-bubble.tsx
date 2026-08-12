@@ -120,7 +120,7 @@ function MessageContent({ message }: { message: Message }) {
   switch (message.content_type) {
     case "text":
       return (
-        <p className="whitespace-pre-wrap break-words text-sm">
+        <p className="whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] text-sm">
           {message.content_text}
         </p>
       );
@@ -134,7 +134,7 @@ function MessageContent({ message }: { message: Message }) {
             <MediaUnavailable label="Image" />
           )}
           {message.content_text && (
-            <p className="mt-1 whitespace-pre-wrap break-words text-sm">
+            <p className="mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] text-sm">
               {message.content_text}
             </p>
           )}
@@ -154,7 +154,7 @@ function MessageContent({ message }: { message: Message }) {
             <MediaUnavailable label="Video" />
           )}
           {message.content_text && (
-            <p className="mt-1 whitespace-pre-wrap break-words text-sm">
+            <p className="mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] text-sm">
               {message.content_text}
             </p>
           )}
@@ -184,7 +184,7 @@ function MessageContent({ message }: { message: Message }) {
           className="flex items-center gap-2 rounded-lg bg-slate-700/50 px-3 py-2 text-sm hover:bg-slate-700"
         >
           <FileText className="h-5 w-5 shrink-0 text-slate-400" />
-          <span className="truncate">
+          <span className="min-w-0 truncate">
             {message.content_text || "Document"}
           </span>
         </a>
@@ -198,7 +198,7 @@ function MessageContent({ message }: { message: Message }) {
             Template
           </span>
           {message.content_text && (
-            <p className="mt-1 whitespace-pre-wrap break-words text-sm">
+            <p className="mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] text-sm">
               {message.content_text}
             </p>
           )}
@@ -209,11 +209,23 @@ function MessageContent({ message }: { message: Message }) {
       return (
         <div className="flex items-center gap-2 text-sm">
           <MapPin className="h-4 w-4 shrink-0 text-slate-400" />
-          <span>{message.content_text || "Location shared"}</span>
+          <span className="[overflow-wrap:anywhere] [word-break:break-word]">{message.content_text || "Location shared"}</span>
         </div>
       );
 
     case "interactive": {
+      // An OUTBOUND interactive message (bot/agent prompt carrying the
+      // reply buttons) is the ORIGINAL message the customer is tapping —
+      // render it as a normal message so the conversation shows the
+      // original prompt AND the customer's tap as two separate messages.
+      // Only the INBOUND customer tap gets the "Button reply" affordance.
+      if (message.sender_type !== "customer") {
+        return (
+          <p className="whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] text-sm">
+            {message.content_text || "[Interactive message]"}
+          </p>
+        );
+      }
       // Customer tapped a reply button or list row on a message the bot
       // sent. We show the tapped option's title (already in content_text,
       // set by parseMessageContent in the webhook) with a small affordance
@@ -225,7 +237,7 @@ function MessageContent({ message }: { message: Message }) {
             <CornerDownLeft className="h-3 w-3" />
             Button reply
           </span>
-          <p className="whitespace-pre-wrap break-words text-sm">
+          <p className="whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] text-sm">
             {message.content_text || "[Interactive reply]"}
           </p>
         </div>
@@ -234,7 +246,7 @@ function MessageContent({ message }: { message: Message }) {
 
     default:
       return (
-        <p className="whitespace-pre-wrap break-words text-sm">
+        <p className="whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] text-sm">
           {message.content_text || "[Unsupported message type]"}
         </p>
       );
@@ -256,13 +268,13 @@ export function MessageBubble({
   return (
     <div
       className={cn(
-        "flex flex-col",
+        "flex flex-col min-w-0",
         isAgent ? "items-end" : "items-start",
       )}
     >
       <div
         className={cn(
-          "relative rounded-2xl px-3 py-2",
+          "relative max-w-full rounded-2xl px-3 py-2",
           isAgent
             ? "rounded-br-md bg-primary text-primary-foreground"
             : "rounded-bl-md bg-slate-800 text-slate-100",

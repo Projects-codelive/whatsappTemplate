@@ -77,7 +77,7 @@ export function MessageComposer({
   );
 
   return (
-    <div className="border-t border-slate-800 bg-slate-900 p-3">
+    <div className="min-w-0 border-t border-slate-800 bg-slate-900 p-3">
       {replyTo && (
         <div className="mb-2">
           <ReplyQuote
@@ -104,7 +104,7 @@ export function MessageComposer({
         </div>
       )}
 
-      <div className="flex items-end gap-2">
+      <div className="flex min-w-0 items-end gap-2">
         <Button
           variant="ghost"
           size="sm"
@@ -128,7 +128,7 @@ export function MessageComposer({
           disabled={sessionExpired}
           rows={1}
           className={cn(
-            "flex-1 resize-none rounded-xl border border-slate-700 bg-slate-800 px-4 py-2.5 text-sm text-white placeholder-slate-500 outline-none transition-colors focus:border-primary/50",
+            "min-w-0 flex-1 resize-none rounded-xl border border-slate-700 bg-slate-800 px-4 py-2.5 text-sm text-white placeholder-slate-500 outline-none transition-colors focus:border-primary/50",
             sessionExpired && "cursor-not-allowed opacity-50"
           )}
         />

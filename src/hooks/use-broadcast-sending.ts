@@ -62,7 +62,59 @@ const SEND_BATCH_DELAY_MS = 1000;
 /** `broadcast_recipients` inserts are independent of the send rate. */
 const INSERT_BATCH_SIZE = 200;
 
-function sleep(ms: number) {
+const PERSIST_RETRIES = 3;
+const PERSIST_RETRY_BASE_DELAY_MS = 300;
+
+export interface PersistRecipientUpdateResult {
+  success: boolean;
+  attempts: number;
+  errorMessage?: string;
+}
+
+/**
+ * Bounded-retry persistence for broadcast_recipients rows.
+ *
+ * Guarantees:
+ *   - At most PERSIST_RETRIES attempts.
+ *   - Short linear backoff between attempts.
+ *   - Meta send is never retried here — this ONLY retries the DB write.
+ */
+export async function persistRecipientUpdate(
+  supabase: ReturnType<typeof createClient>,
+  recipientId: string,
+  updatePayload: Record<string, unknown>,
+): Promise<PersistRecipientUpdateResult> {
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= PERSIST_RETRIES; attempt++) {
+    const { error: retryErr } = await supabase
+      .from("broadcast_recipients")
+      .update(updatePayload)
+      .eq("id", recipientId);
+
+    if (!retryErr) {
+      return { success: true, attempts: attempt };
+    }
+
+    lastError = retryErr;
+    if (attempt < PERSIST_RETRIES) {
+      await sleep(PERSIST_RETRY_BASE_DELAY_MS * attempt);
+    }
+  }
+
+  const message =
+    lastError instanceof Error
+      ? lastError.message
+      : typeof lastError === 'object' && lastError !== null && 'message' in lastError
+        ? String((lastError as Record<string, unknown>).message)
+        : 'Unknown persistence error';
+  console.error(
+    `[broadcast] failed to persist broadcast_recipients update for ${recipientId} after ${PERSIST_RETRIES} attempts:`,
+    message,
+  );
+  return { success: false, attempts: PERSIST_RETRIES, errorMessage: message };
+}
+
+export function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -489,15 +541,27 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
             }
 
             if (result.status === 'sent') {
-              await supabase
-                .from('broadcast_recipients')
-                .update({
+              const persistResult = await persistRecipientUpdate(
+                supabase,
+                recipient.id,
+                {
                   status: 'sent',
                   sent_at: new Date().toISOString(),
                   whatsapp_message_id: result.whatsapp_message_id ?? null,
                   error_message: null,
-                })
-                .eq('id', recipient.id);
+                },
+              );
+
+              if (!persistResult.success) {
+                failedCount++;
+                await supabase
+                  .from('broadcast_recipients')
+                  .update({
+                    status: 'failed',
+                    error_message: `Failed to record send: ${persistResult.errorMessage}`,
+                  })
+                  .eq('id', recipient.id);
+              }
             } else {
               failedCount++;
               await supabase

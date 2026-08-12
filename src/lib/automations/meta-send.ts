@@ -34,6 +34,13 @@ interface SendTemplateArgs {
   templateName: string
   language?: string
   params?: TemplateVariableValue[]
+  /**
+   * The template body rendered with the resolved params — the exact text
+   * the customer received. Persisted as `content_text` so the Inbox can
+   * render the original template bubble with its real content (mirrors
+   * what the manual send route stores for templates sent from the inbox).
+   */
+  contentText?: string
 }
 
 export async function engineSendText(args: SendTextArgs): Promise<{ whatsapp_message_id: string }> {
@@ -135,9 +142,13 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
 
   // Persist the sent message so it appears in the inbox with a real
   // Meta message id. sender_type='bot' distinguishes automation sends
-  // from manual agent sends.
+  // from manual agent sends. For templates the engine passes the rendered
+  // body as contentText so the inbox shows the actual template content
+  // (a NULL content_text would render the template bubble as empty —
+  // the original message would appear missing from the conversation).
   const content_type = input.kind === 'template' ? 'template' : 'text'
-  const content_text = input.kind === 'text' ? input.text : null
+  const content_text =
+    input.kind === 'template' ? (input.contentText ?? null) : input.text
   const template_name = input.kind === 'template' ? input.templateName : null
 
   const { error: msgErr } = await db.from('messages').insert({

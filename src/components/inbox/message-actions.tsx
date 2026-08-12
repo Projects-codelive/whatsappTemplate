@@ -79,13 +79,13 @@ export function MessageActions({
   return (
     <div
       className={cn(
-        "flex w-full",
+        "flex w-full min-w-0",
         isAgent ? "justify-end" : "justify-start",
       )}
       onContextMenu={handleContextMenu}
       onBlur={() => setTouchOpen(false)}
     >
-      <div className="group/actions relative max-w-[75%]">
+      <div className="group/actions relative max-w-[75%] min-w-0">
         {children}
       <div
         data-touch-open={touchOpen || pickerOpen ? "true" : undefined}

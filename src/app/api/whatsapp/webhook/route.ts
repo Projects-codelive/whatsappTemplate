@@ -4,6 +4,10 @@ import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
 import { normalizePhone, phonesMatch } from '@/lib/whatsapp/phone-utils'
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
+import {
+  orderVariableKeys,
+  renderTemplateBody,
+} from '@/lib/whatsapp/template-variables'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 
@@ -439,6 +443,148 @@ async function lookupInternalIdByMetaId(
 }
 
 /**
+ * The variable mapping shape stored on `broadcasts.template_variables`
+ * by the broadcast composer (see src/hooks/use-broadcast-sending.ts) —
+ * each template placeholder maps to a static value, a built-in contact
+ * field, or a custom-field id.
+ */
+interface BroadcastVariableMapping {
+  type: 'static' | 'field' | 'custom_field'
+  value: string
+}
+
+/**
+ * Reconstruct the original template message for a reply that references
+ * a broadcast send.
+ *
+ * Broadcasts persist the recipient + Meta message id on
+ * `broadcast_recipients` but never insert a `messages` row, so when a
+ * broadcast recipient later replies — e.g. taps a quick-reply button —
+ * the Inbox has no original message to render above the reply. This
+ * looks the Meta message id up on the recipient row, re-resolves the
+ * broadcast's stored variable mappings against this contact, and
+ * persists the template as a normal outbound message so the
+ * conversation shows:
+ *
+ *   [Original template]  →  [Button reply]
+ *
+ * Returns the internal id of the reconstructed row (for use as the
+ * reply's reply_to_message_id), or null when the referenced message
+ * wasn't a broadcast (or couldn't be rebuilt — the reply then renders
+ * standalone exactly as before).
+ */
+async function restoreBroadcastTemplateRow(args: {
+  metaId: string
+  conversationId: string
+  contactId: string
+  contact: {
+    name?: string | null
+    phone?: string | null
+    email?: string | null
+    company?: string | null
+  }
+}): Promise<string | null> {
+  const db = supabaseAdmin()
+
+  // The recipient row for this exact sent message. `whatsapp_message_id`
+  // is populated by the send hook the moment Meta accepts the message,
+  // so a match here proves the reply targets a broadcast send.
+  const { data: recipient, error: recError } = await db
+    .from('broadcast_recipients')
+    .select('broadcast_id, sent_at')
+    .eq('whatsapp_message_id', args.metaId)
+    .maybeSingle()
+  if (recError || !recipient) return null
+
+  // Broadcast that sent it — carries the template identity + the
+  // per-placeholder variable mappings used at send time.
+  const { data: broadcast, error: bcError } = await db
+    .from('broadcasts')
+    .select('user_id, template_name, template_variables')
+    .eq('id', recipient.broadcast_id)
+    .maybeSingle()
+  if (bcError || !broadcast) {
+    console.error('[webhook] restoreBroadcastTemplateRow: broadcast not found:', bcError?.message)
+    return null
+  }
+
+  // The approved template body — same source the broadcast renderer uses.
+  const { data: templateRows } = await db
+    .from('message_templates')
+    .select('body_text')
+    .eq('user_id', broadcast.user_id)
+    .eq('name', broadcast.template_name)
+    .limit(1)
+  const bodyText =
+    typeof templateRows?.[0]?.body_text === 'string'
+      ? templateRows[0].body_text
+      : undefined
+
+  // Re-resolve this contact's variable values exactly like the send did
+  // (static / contact-field / custom-field mappings) and render the body
+  // so the reconstructed bubble shows the text the customer received.
+  let contentText: string | null = null
+  if (bodyText && broadcast.template_variables) {
+    const variables = broadcast.template_variables as Record<
+      string,
+      BroadcastVariableMapping
+    >
+    const { data: customValues } = await db
+      .from('contact_custom_values')
+      .select('custom_field_id, value')
+      .eq('contact_id', args.contactId)
+    const customMap = new Map<string, string>()
+    for (const row of customValues ?? []) {
+      customMap.set(row.custom_field_id, row.value ?? '')
+    }
+    const fieldValues: Record<string, string | undefined> = {
+      name: args.contact.name ?? undefined,
+      phone: args.contact.phone ?? undefined,
+      email: args.contact.email ?? undefined,
+      company: args.contact.company ?? undefined,
+    }
+    const params = orderVariableKeys(variables, bodyText).map((key) => {
+      const mapping = variables[key]
+      if (mapping?.type === 'static') return { key, value: mapping.value }
+      if (mapping?.type === 'field') {
+        return { key, value: fieldValues[mapping.value] ?? '' }
+      }
+      return { key, value: customMap.get(mapping?.value ?? '') ?? '' }
+    })
+    contentText = renderTemplateBody(
+      bodyText,
+      params.map((p) => p.value),
+    )
+  }
+
+  // Persist the template as a normal outbound message. `created_at` uses
+  // the recipient's send timestamp so the template sorts above the reply.
+  const { data: inserted, error: msgError } = await db
+    .from('messages')
+    .insert({
+      conversation_id: args.conversationId,
+      sender_type: 'agent',
+      content_type: 'template',
+      content_text: contentText,
+      template_name: broadcast.template_name,
+      message_id: args.metaId,
+      status: 'delivered',
+      created_at: recipient.sent_at ?? new Date().toISOString(),
+    })
+    .select('id')
+    .single()
+
+  if (msgError) {
+    console.error(
+      '[webhook] restoreBroadcastTemplateRow: insert failed:',
+      msgError.message,
+    )
+    return null
+  }
+  return inserted?.id ?? null
+}
+
+/**
  * Persist an inbound reaction. WhatsApp reactions are not new messages —
  * they're per-(target, actor) state. We upsert / delete on
  * `message_reactions`, never write a row into `messages`.
@@ -534,14 +680,25 @@ export async function processMessage(
   const { contentText, mediaUrl, mediaType, interactiveReplyId } =
     await parseMessageContent(message, accessToken)
 
-  // Resolve swipe-reply context if present. A missing parent is fine —
-  // we just store NULL and the UI renders the message without a quote.
+  // Resolve swipe-reply context if present. A missing parent is usually
+  // fine — we store NULL and the UI renders the message without a quote.
+  // But when the reply targets a broadcast send, no messages row exists,
+  // so we reconstruct the original template first (see
+  // restoreBroadcastTemplateRow) to keep it visible above the reply.
   let replyToInternalId: string | null = null
   if (message.context?.id) {
     replyToInternalId = await lookupInternalIdByMetaId(
       message.context.id,
       conversation.id
     )
+    if (!replyToInternalId) {
+      replyToInternalId = await restoreBroadcastTemplateRow({
+        metaId: message.context.id,
+        conversationId: conversation.id,
+        contactId: contactRecord.id,
+        contact: contactRecord,
+      })
+    }
     if (!replyToInternalId) {
       console.warn(
         '[webhook] reply context parent not found:',
@@ -572,7 +729,15 @@ export async function processMessage(
     ? message.type
     : message.type === 'sticker'
       ? 'image'   // stickers are images
-      : 'text'    // reaction, unknown → text fallback
+      : message.type === 'button'
+        // Template quick-reply button tap. Stored as 'interactive' so the
+        // inbox renders it with the button-reply affordance (the tapped
+        // label is already extracted as contentText by parseMessageContent),
+        // instead of an ordinary typed message. The reply relationship to
+        // the original template is preserved separately via
+        // reply_to_message_id (resolved from message.context.id below).
+        ? 'interactive'
+        : 'text'  // reaction, unknown → text fallback
 
   // Determine whether this is the contact's very first inbound message
   // BEFORE we insert, so the count is accurate. Covers the case where
@@ -595,9 +760,10 @@ export async function processMessage(
     status: 'delivered',
     created_at: new Date(parseInt(message.timestamp) * 1000).toISOString(),
     reply_to_message_id: replyToInternalId,
-    // Only populated for content_type='interactive'. Migration 010 added
-    // the column; null for every other content_type so existing inserts
-    // behave identically.
+    // Only populated for interactive button/list taps (reply id present).
+    // Migration 010 added the column; null for everything else — typed
+    // text, media, and template quick-reply taps (which carry a payload,
+    // not a stable reply id) — so existing inserts behave identically.
     interactive_reply_id: interactiveReplyId,
   })
 
@@ -844,12 +1010,13 @@ export async function parseMessageContent(
     case 'button': {
       // The customer tapped a quick-reply button on a template we sent.
       // Meta delivers this with type='button' and button.text set to the
-      // tapped label ("Yes"/"No"). Normalize it into the existing text
-      // representation — content_type maps to 'text' downstream, so the
-      // Inbox renders it exactly like a typed "Yes"/"No". (Template
-      // buttons carry a payload, not a stable reply id, so we don't
-      // populate interactiveReplyId — that column is reserved for
-      // content_type='interactive' button_reply/list_reply taps.)
+      // tapped label ("Yes"/"No"). Extract that label as contentText;
+      // processMessage maps the stored content_type to 'interactive' so
+      // the Inbox renders it with the button-reply affordance rather than
+      // like a typed message. (Template buttons carry a payload, not a
+      // stable reply id, so we don't populate interactiveReplyId — that
+      // column is reserved for content_type='interactive' button_reply/
+      // list_reply taps.)
       return { ...empty, contentText: message.button?.text || null }
     }
 
