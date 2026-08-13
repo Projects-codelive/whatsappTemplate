@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 import type { Conversation, ConversationStatus } from "@/types";
+import { isConversationUnread } from "@/lib/inbox/unread";
 import { Search, ChevronDown } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { Input } from "@/components/ui/input";
@@ -29,12 +30,6 @@ interface ConversationListProps {
    */
   resyncToken?: number;
 }
-
-const STATUS_COLORS: Record<ConversationStatus, string> = {
-  open: "bg-primary",
-  pending: "bg-amber-500",
-  closed: "bg-slate-500",
-};
 
 const FILTER_OPTIONS: { label: string; value: ConversationStatus | "all" }[] = [
   { label: "All", value: "all" },
@@ -273,18 +268,14 @@ function ConversationItem({
             {conversation.last_message_text || "No messages yet"}
           </p>
           <div className="flex shrink-0 items-center gap-1.5">
-            {conversation.unread_count > 0 && (
+            {isConversationUnread(conversation) && (
               <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
                 {conversation.unread_count}
               </span>
             )}
-            <span
-              className={cn(
-                "h-2 w-2 rounded-full",
-                STATUS_COLORS[conversation.status]
-              )}
-              title={conversation.status}
-            />
+            {isConversationUnread(conversation) && (
+              <span className="h-2 w-2 rounded-full bg-primary" title="Unread" />
+            )}
           </div>
         </div>
       </div>

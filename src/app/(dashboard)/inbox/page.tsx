@@ -5,6 +5,8 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import type { Conversation, Message, Contact, ConversationStatus } from "@/types";
 import { useRealtime } from "@/hooks/use-realtime";
+import { applyConversationUpdate, applyMessageInsert } from "@/lib/inbox/list";
+import { sortConversationsByActivity } from "@/lib/inbox/sort";
 import { ConversationList } from "@/components/inbox/conversation-list";
 import { MessageThread } from "@/components/inbox/message-thread";
 import { ContactSidebar } from "@/components/inbox/contact-sidebar";
@@ -114,7 +116,7 @@ export default function InboxPage() {
               : c,
           );
         }
-        return [fetched, ...prev];
+        return sortConversationsByActivity([fetched, ...prev]);
       });
     } finally {
       hydratingConvIdsRef.current.delete(convId);
@@ -174,21 +176,37 @@ export default function InboxPage() {
         // knownConvIdsRef for why a closure flag inside the updater would
         // always read false here.
         if (knownConvIdsRef.current.has(newMsg.conversation_id)) {
+          // Patch the preview + unread state and re-sort so the
+          // conversation with the latest activity moves to the top.
+          // unreadAfterMessageInsert (inside applyMessageInsert) encodes
+          // the rule: ONLY an inbound customer message to a conversation
+          // the agent is NOT viewing makes it unread; the agent/bot's
+          // own outgoing message INSERT never does.
           setConversations((prev) =>
-            prev.map((c) =>
-              c.id === newMsg.conversation_id
-                ? {
-                    ...c,
-                    last_message_text: newMsg.content_text ?? "",
-                    last_message_at: newMsg.created_at,
-                    unread_count:
-                      activeConversation?.id === newMsg.conversation_id
-                        ? 0
-                        : c.unread_count + 1,
-                  }
-                : c,
+            applyMessageInsert(
+              prev,
+              newMsg,
+              activeConversation?.id === newMsg.conversation_id,
             ),
           );
+          // A customer message landing in the thread the agent is
+          // currently reading: surface a positive unread on
+          // activeConversation so MessageThread's reset effect persists
+          // unread_count: 0 at the source of truth even if the matching
+          // conversation-UPDATE realtime event is delayed or dropped.
+          // The list badge stays suppressed (the open thread IS the read
+          // acknowledgment) — this only feeds the reset effect, it never
+          // paints a dot.
+          if (
+            newMsg.sender_type === "customer" &&
+            activeConversation?.id === newMsg.conversation_id
+          ) {
+            setActiveConversation((prev) =>
+              prev
+                ? { ...prev, unread_count: (prev.unread_count ?? 0) + 1 }
+                : prev,
+            );
+          }
         } else {
           // First time we're seeing this conv: the conv-INSERT event
           // hasn't landed yet, or was missed. Hydrate from the DB so
@@ -227,7 +245,7 @@ export default function InboxPage() {
         if (!knownConvIdsRef.current.has(conv.id)) {
           setConversations((prev) => {
             if (prev.some((c) => c.id === conv.id)) return prev;
-            return [conv, ...prev];
+            return sortConversationsByActivity([conv, ...prev]);
           });
           hydrateConversation(conv.id);
         }
@@ -242,15 +260,7 @@ export default function InboxPage() {
           // UPDATE to round-trip. Non-active convs take the value as-is.
           const isActive = activeConversation?.id === conv.id;
           setConversations((prev) =>
-            prev.map((c) =>
-              c.id === conv.id
-                ? {
-                    ...c,
-                    ...conv,
-                    unread_count: isActive ? 0 : conv.unread_count,
-                  }
-                : c,
-            ),
+            applyConversationUpdate(prev, conv, isActive),
           );
         } else {
           // UPDATE arrived before the INSERT (or after a missed INSERT)
@@ -336,7 +346,35 @@ export default function InboxPage() {
 
   const handleConversationsLoaded = useCallback(
     (loaded: Conversation[]) => {
-      setConversations(loaded);
+      // A refetch replaces the whole list with fresh DB rows. If the fetch
+      // reports the conversation the user is CURRENTLY viewing as unread
+      // (e.g. the reset effect's server UPDATE hasn't round-tripped yet),
+      // keep its badge suppressed here — same rule as the realtime UPDATE
+      // handler — and reconcile the value onto activeConversation so
+      // MessageThread's reset effect still persists the read state.
+      // Without this, a refetch landing in that window would put the dot
+      // back on the open thread and it would stick until the next realtime
+      // event (or forever, if the conversation UPDATE event was dropped).
+      const activeId = activeConversation?.id ?? null;
+      let activeUnreadInLoaded = 0;
+      if (activeId) {
+        const activeRow = loaded.find((c) => c.id === activeId);
+        activeUnreadInLoaded = activeRow?.unread_count ?? 0;
+      }
+      setConversations(
+        sortConversationsByActivity(
+          activeId
+            ? loaded.map((c) =>
+                c.id === activeId ? { ...c, unread_count: 0 } : c,
+              )
+            : loaded,
+        ),
+      );
+      if (activeId && activeUnreadInLoaded > 0) {
+        setActiveConversation((prev) =>
+          prev ? { ...prev, unread_count: activeUnreadInLoaded } : prev,
+        );
+      }
       // Resolve a pending deep-link here rather than in an effect — this
       // is an event handler, so the setState calls below are allowed by
       // react-hooks/set-state-in-effect. Runs once per ?c=<id> URL value

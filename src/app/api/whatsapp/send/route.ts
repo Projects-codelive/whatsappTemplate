@@ -273,12 +273,19 @@ export async function POST(request: Request) {
       )
     }
 
-    // Update conversation
+    // Update conversation. `unread_count: 0` — an agent reply is the
+    // acknowledgment that the customer's message has been read, so a
+    // successful outbound send must clear any pending unread state at
+    // the source of truth. The webhook is the only writer that ever
+    // INCREMENTS unread_count (inbound customer messages); this reset
+    // makes the read side deterministic instead of relying solely on
+    // the client's reset effect firing.
     await supabase
       .from('conversations')
       .update({
         last_message_text: content_text || `[${message_type}]`,
         last_message_at: new Date().toISOString(),
+        unread_count: 0,
         updated_at: new Date().toISOString(),
       })
       .eq('id', conversation_id)

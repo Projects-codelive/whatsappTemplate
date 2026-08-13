@@ -19,6 +19,13 @@ const supabaseMock = vi.hoisted(() => {
     // When true the message_id lookup returns "parent not found", forcing
     // the webhook down the broadcast-reconstruction path.
     lookupParentMissing: false,
+    // Existing conversation returned by findOrCreateConversation's lookup.
+    // When set, the webhook treats the message as belonging to an existing
+    // conversation (and increments from its unread_count) instead of
+    // creating a fresh one.
+    existingConversation: undefined as
+      | { id: string; unread_count: number }
+      | undefined,
     // Broadcast data returned by the reconstruction lookups. When set, the
     // webhook rebuilds the original template from these rows instead of
     // storing the reply orphaned.
@@ -140,11 +147,14 @@ const supabaseMock = vi.hoisted(() => {
             if (table === "broadcasts" && state.broadcast) {
               return { data: state.broadcast, error: null };
             }
-            return {
-              data: null,
-              error:
-                table === "conversations" ? { message: "not found" } : null,
-            };
+            // findOrCreateConversation's existing-row lookup.
+            if (table === "conversations") {
+              if (state.existingConversation) {
+                return { data: state.existingConversation, error: null };
+              }
+              return { data: null, error: { message: "not found" } };
+            }
+            return { data: null, error: null };
           }
           // Table-scoped lookups that end in eq/limit (not single).
           if (table === "message_templates") {
@@ -173,6 +183,7 @@ const supabaseMock = vi.hoisted(() => {
       state.updates = [];
       state.lookupParentId = undefined;
       state.lookupParentMissing = false;
+      state.existingConversation = undefined;
       state.broadcastRecipient = undefined;
       state.broadcast = undefined;
       state.templateBody = undefined;
@@ -331,6 +342,8 @@ describe("processMessage — full inbound pipeline for button replies", () => {
     );
     expect(convUpdate).toBeDefined();
     expect(convUpdate!.payload.last_message_text).toBe("Yes");
+    // Inbound customer message marks the conversation unread (TEST 1).
+    expect(convUpdate!.payload.unread_count).toBe(1);
   });
 
   it("stores a NO template button reply as an interactive reply in the conversation", async () => {
@@ -674,5 +687,100 @@ describe("processMessage — manually typed text stays a normal text message", (
     expect(messageInsert!.payload.content_type).toBe("text");
     expect(messageInsert!.payload.interactive_reply_id).toBeNull();
     expect(messageInsert!.payload.reply_to_message_id).toBeNull();
+  });
+});
+
+describe("processMessage — unread/read state on the conversation", () => {
+  function typedText(text: string): WhatsAppMessage {
+    return {
+      from: "16505551234",
+      id: `wamid.text.${text.toLowerCase()}`,
+      timestamp: "1714510003",
+      type: "text",
+      text: { body: text },
+    };
+  }
+
+  // TEST 1 — an inbound customer message makes the conversation unread.
+  it("marks the conversation unread on the first inbound message", async () => {
+    await processMessage(typedText("Hello"), CONTACT, "user-1", "token");
+
+    const convUpdate = supabaseMock.state.updates.find(
+      (u) => u.table === "conversations",
+    );
+    expect(convUpdate).toBeDefined();
+    expect(convUpdate!.payload.unread_count).toBe(1);
+  });
+
+  // TEST 5 — after the agent has read/replied (unread 0), the customer's
+  // next message makes the conversation unread again.
+  it("re-marks the conversation unread when the customer messages again after it was read", async () => {
+    supabaseMock.state.existingConversation = { id: "conv-1", unread_count: 0 };
+    await processMessage(typedText("Hello again"), CONTACT, "user-1", "token");
+
+    const convUpdate = supabaseMock.state.updates.find(
+      (u) => u.table === "conversations",
+    );
+    expect(convUpdate!.payload.unread_count).toBe(1);
+  });
+
+  // TEST 10 — the unread count increments from the conversation's own
+  // current value; a customer message never resets or clobbers another
+  // conversation's unread state.
+  it("increments from the conversation's existing unread count", async () => {
+    supabaseMock.state.existingConversation = { id: "conv-1", unread_count: 4 };
+    await processMessage(typedText("Another one"), CONTACT, "user-1", "token");
+
+    const convUpdate = supabaseMock.state.updates.find(
+      (u) => u.table === "conversations",
+    );
+    expect(convUpdate!.payload.unread_count).toBe(5);
+  });
+
+  // TEST 10 — two separate inbound messages (different conversations) each
+  // carry their own unread count; the webhook never touches another
+  // conversation's unread state.
+  it("keeps per-conversation unread counts independent", async () => {
+    supabaseMock.state.existingConversation = { id: "conv-a", unread_count: 2 };
+    await processMessage(typedText("To A"), CONTACT, "user-1", "token");
+
+    const updateA = supabaseMock.state.updates.find(
+      (u) => u.table === "conversations",
+    );
+    expect(updateA!.payload.unread_count).toBe(3);
+
+    // Second message to a different conversation — its own count, and the
+    // update targets its own conversation id.
+    supabaseMock.state.existingConversation = { id: "conv-b", unread_count: 0 };
+    supabaseMock.state.updates = [];
+    await processMessage(typedText("To B"), CONTACT, "user-1", "token");
+
+    const updateB = supabaseMock.state.updates.find(
+      (u) => u.table === "conversations",
+    );
+    expect(updateB!.payload.unread_count).toBe(1);
+  });
+
+  // TEST 5 — a second inbound message accumulates unread on top of the
+  // first (1 → 2), one bump per message.
+  it("accumulates unread across consecutive inbound messages", async () => {
+    await processMessage(typedText("First"), CONTACT, "user-1", "token");
+    let convUpdates = supabaseMock.state.updates.filter(
+      (u) => u.table === "conversations",
+    );
+    expect(convUpdates).toHaveLength(1);
+    expect(convUpdates[0].payload.unread_count).toBe(1);
+
+    // The conversation now exists with the unread count from the first
+    // message; the second inbound bumps it to 2.
+    supabaseMock.state.existingConversation = { id: "conv-1", unread_count: 1 };
+    supabaseMock.state.updates = [];
+    await processMessage(typedText("Second"), CONTACT, "user-1", "token");
+
+    convUpdates = supabaseMock.state.updates.filter(
+      (u) => u.table === "conversations",
+    );
+    expect(convUpdates).toHaveLength(1);
+    expect(convUpdates[0].payload.unread_count).toBe(2);
   });
 });
