@@ -201,9 +201,19 @@ export interface SendFcmMessageArgs {
   image?: string;
 }
 
+interface FcmSuccessResponse {
+  name?: string;
+}
+
 /** Send one FCM HTTP v1 message to a single device token. Throws on
- *  failure; callers loop and collect per-user results. */
-export async function sendFcmMessage(args: SendFcmMessageArgs): Promise<void> {
+ *  failure; callers loop and collect per-user results.
+ *
+ *  Returns `{ messageId }` extracted from the Firebase response body
+ *  when available (the `name` field in HTTP v1). Callers can persist
+ *  this as the provider message id for tracking/dedup. */
+export async function sendFcmMessage(
+  args: SendFcmMessageArgs,
+): Promise<{ messageId?: string }> {
   const { accessToken, token, title, body, agent, data, image } = args;
   const url = `${FCM_BASE_URL}/${loadProjectId()}/messages:send`;
 
@@ -219,5 +229,12 @@ export async function sendFcmMessage(args: SendFcmMessageArgs): Promise<void> {
 
   if (!response.ok) {
     await throwFcmError(response, `Firebase error: HTTP ${response.status}`);
+  }
+
+  try {
+    const json = (await response.json()) as FcmSuccessResponse;
+    return { messageId: json.name };
+  } catch {
+    return {};
   }
 }

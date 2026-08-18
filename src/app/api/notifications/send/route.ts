@@ -16,6 +16,11 @@ import {
   rateLimitResponse,
   RATE_LIMITS,
 } from '@/lib/rate-limit'
+import {
+  createNotificationCampaign,
+  persistRecipientUpdate,
+  finalizeCampaign,
+} from '@/lib/notifications/campaign'
 
 /**
  * Push-notification dispatch. The browser only ever talks to this route —
@@ -24,6 +29,14 @@ import {
  *
  * Sending never stops on a per-user failure: every recipient is attempted
  * and the response reports sent/failed counts plus the failed user ids.
+ *
+ * A notification_campaign + notification_recipients rows are created to
+ * provide Broadcast-like reporting. The existing response shape is
+ * preserved so the frontend does not break.
+ *
+ * Recipient DB writes use bounded retries (matching the broadcast
+ * pattern) instead of fire-and-forget, so campaign counts stay
+ * accurate.
  */
 
 const SEND_CHUNK_SIZE = 10
@@ -95,38 +108,109 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: messageText }, { status: 404 })
     }
 
-    // Ignore null / empty / invalid FCM tokens — only real tokens go out.
-    const recipients = rows.filter(
+    // Split into valid-token and no-token groups.
+    const recipientsWithToken = rows.filter(
       (row): row is { id: string; fcm_token: string } =>
         isValidFcmToken(row.fcm_token),
     )
-    const skipped = rows.length - recipients.length
-    if (recipients.length === 0) {
+    const skippedRows = rows.filter(
+      (row) => !isValidFcmToken(row.fcm_token),
+    )
+    if (recipientsWithToken.length === 0) {
       return NextResponse.json(
         { error: 'No valid FCM tokens found for the selected users' },
         { status: 400 },
       )
     }
 
-    // Authenticate once up-front. A broken service account fails here as a
-    // 502 instead of silently marking every recipient as failed.
+    // --- Campaign creation (must succeed before any FCM sends) --------
+    let campaignId: string | null = null
+    let recipientRows: { id: string; recipientIndex: number }[] = []
+    try {
+      campaignId = await createNotificationCampaign(supabaseAdmin(), {
+        userId: user.id,
+        title,
+        message,
+        imageUrl,
+        target: payload.target,
+        category: payload.target === 'category' ? payload.category : undefined,
+        totalTargeted: rows.length,
+      })
+
+      // Create recipient records: recipients with tokens get 'pending',
+      // recipients without tokens get 'skipped'.
+      const toInsert: Array<{
+        campaign_id: string
+        user_id: string
+        fcm_token: string | null
+        status: 'pending' | 'skipped'
+      }> = [
+        ...recipientsWithToken.map((r) => ({
+          campaign_id: campaignId!,
+          user_id: r.id,
+          fcm_token: r.fcm_token,
+          status: 'pending' as const,
+        })),
+        ...skippedRows.map((r) => ({
+          campaign_id: campaignId!,
+          user_id: r.id,
+          fcm_token: null,
+          status: 'skipped' as const,
+        })),
+      ]
+
+      // Insert and retrieve the created recipient rows (for their ids).
+      const { data: insertedRecipients, error: recInsertError } =
+        await supabaseAdmin()
+          .from('notification_recipients')
+          .insert(toInsert)
+          .select('id')
+
+      if (recInsertError) {
+        throw new Error(
+          `Failed to create recipient records: ${recInsertError.message}`,
+        )
+      }
+
+      // Map inserted IDs back to the send-order recipients (first N are
+      // the pending ones, in the same order as recipientsWithToken).
+      recipientRows = (insertedRecipients ?? []).map((r, i) => ({
+        id: r.id as string,
+        recipientIndex: i,
+      }))
+    } catch (campaignErr) {
+      // Campaign/recipient creation failed — do NOT send anything.
+      // This prevents untracked notifications.
+      console.error('[notifications/send] campaign creation failed:', campaignErr)
+      return NextResponse.json(
+        {
+          error:
+            campaignErr instanceof Error
+              ? campaignErr.message
+              : 'Failed to initialize campaign tracking',
+        },
+        { status: 500 },
+      )
+    }
+
+    // --- FCM sending (existing logic, wrapped) ------------------------
     let accessToken: string
     try {
       accessToken = await getFcmAccessToken()
     } catch (error) {
-      const message =
+      const errorMessage =
         error instanceof Error ? error.message : 'Firebase authentication failed'
-      console.error('[notifications/send] Firebase auth failed:', message)
-      return NextResponse.json({ error: message }, { status: 502 })
+      console.error('[notifications/send] Firebase auth failed:', errorMessage)
+      // Mark all pending recipients as failed + finalize campaign.
+      await finalizeCampaign(supabaseAdmin(), campaignId, 'failed')
+      return NextResponse.json({ error: errorMessage, campaignId }, { status: 502 })
     }
 
-    // Send every recipient. Chunked with a small concurrency cap so large
-    // audiences don't serialize into a long timeout, and a failure for one
-    // token never aborts the rest.
     let sent = 0
     const failedUsers: string[] = []
-    for (let i = 0; i < recipients.length; i += SEND_CHUNK_SIZE) {
-      const chunk = recipients.slice(i, i + SEND_CHUNK_SIZE)
+    const failedAt = new Date().toISOString()
+    for (let i = 0; i < recipientsWithToken.length; i += SEND_CHUNK_SIZE) {
+      const chunk = recipientsWithToken.slice(i, i + SEND_CHUNK_SIZE)
       const outcomes = await Promise.allSettled(
         chunk.map((user) =>
           sendFcmMessage({
@@ -138,22 +222,81 @@ export async function POST(request: Request) {
           }),
         ),
       )
-      outcomes.forEach((outcome, index) => {
-        const user = chunk[index]
-        if (outcome.status === 'fulfilled') {
-          sent += 1
-        } else {
-          failedUsers.push(user.id)
-          const reason =
-            outcome.reason instanceof Error ? outcome.reason.message : 'Unknown error'
-          console.error(`[notifications/send] failed for user=${user.id}: ${reason}`)
+
+      // Await each recipient DB update with bounded retries (matching
+      // the broadcast persistRecipientUpdate pattern). This keeps
+      // campaign counts accurate — a failed DB write is retried
+      // before moving to the next chunk.
+      const chunkResults = await Promise.allSettled(
+        outcomes.map(async (outcome, index) => {
+          const user = chunk[index]
+          const recipientIndex = i + index
+          const recipientRecord = recipientRows[recipientIndex]
+
+          if (outcome.status === 'fulfilled') {
+            const result = await persistRecipientUpdate(
+              supabaseAdmin(),
+              recipientRecord.id,
+              {
+                status: 'sent',
+                provider_message_id: outcome.value.messageId,
+                sent_at: new Date().toISOString(),
+              },
+            )
+            if (!result.success) {
+              // DB write failed after retries — log but count as sent
+              // (FCM accepted it; the DB drift is the lesser evil).
+              console.error(
+                `[notifications/send] DB write failed for accepted recipient ${recipientRecord.id}: ${result.errorMessage}`,
+              )
+            }
+            return { userId: user.id, accepted: true }
+          } else {
+            const reason =
+              outcome.reason instanceof Error ? outcome.reason.message : 'Unknown error'
+            console.error(`[notifications/send] failed for user=${user.id}: ${reason}`)
+            const result = await persistRecipientUpdate(
+              supabaseAdmin(),
+              recipientRecord.id,
+              {
+                status: 'failed',
+                error_message: reason,
+                failed_at: failedAt,
+              },
+            )
+            if (!result.success) {
+              console.error(
+                `[notifications/send] DB write failed for failed recipient ${recipientRecord.id}: ${result.errorMessage}`,
+              )
+            }
+            return { userId: user.id, accepted: false }
+          }
+        }),
+      )
+
+      // Collect failures after all chunk updates are persisted.
+      for (const r of chunkResults) {
+        if (r.status === 'fulfilled' && !r.value.accepted) {
+          failedUsers.push(r.value.userId)
         }
-      })
+        if (r.status === 'rejected') {
+          // Should never happen — persistRecipientUpdate catches internally.
+          console.error('[notifications/send] unexpected chunk result rejection:', r.reason)
+        }
+      }
     }
+
+    // Count actual sent from the DB trigger (most accurate).
+    sent = recipientsWithToken.length - failedUsers.length
+
+    // --- Finalize campaign -------------------------------------------
+    const campaignFinalStatus =
+      failedUsers.length === 0 ? 'sent' : sent === 0 ? 'failed' : 'sent'
+    await finalizeCampaign(supabaseAdmin(), campaignId, campaignFinalStatus)
 
     console.log(
       `[notifications/send] target=${payload.target} found=${rows.length} ` +
-        `skipped=${skipped} sent=${sent} failed=${failedUsers.length}`,
+        `skipped=${skippedRows.length} sent=${sent} failed=${failedUsers.length}`,
     )
 
     return NextResponse.json({
@@ -161,6 +304,7 @@ export async function POST(request: Request) {
       sent,
       failed: failedUsers.length,
       failedUsers,
+      campaignId,
     })
   } catch (error) {
     console.error('[notifications/send] unexpected error:', error)

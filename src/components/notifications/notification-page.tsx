@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { toast } from 'sonner';
 import { createClient } from '@/lib/supabase/client';
 import { syncUsers } from '@/lib/notifications/sync-users';
@@ -20,9 +21,11 @@ import { UserTable } from '@/components/notifications/user-table';
 import { SendNotificationModal } from '@/components/notifications/send-notification-modal';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { History } from 'lucide-react';
 
 export function NotificationPage() {
   const supabase = createClient();
+  const router = useRouter();
 
   const [users, setUsers] = useState<NotificationUser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -136,6 +139,10 @@ export function NotificationPage() {
           `Failed for ${result.failedUsers.length} user(s): ${result.failedUsers.join(', ')}`,
         );
       }
+      // Navigate to the campaign report if available.
+      if (result.campaignId) {
+        router.push(`/notifications/${result.campaignId}`);
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Failed to send notification');
       throw error;
@@ -144,11 +151,21 @@ export function NotificationPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-white">Notifications</h1>
-        <p className="mt-1 text-sm text-slate-400">
-          Manage users and send push notifications.
-        </p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Notifications</h1>
+          <p className="mt-1 text-sm text-slate-400">
+            Manage users and send push notifications.
+          </p>
+        </div>
+        <Button
+          variant="outline"
+          onClick={() => router.push('/notifications/history')}
+          className="border-slate-700 text-slate-300 hover:bg-slate-800"
+        >
+          <History className="h-4 w-4" />
+          Notification History
+        </Button>
       </div>
 
       <UserToolbar

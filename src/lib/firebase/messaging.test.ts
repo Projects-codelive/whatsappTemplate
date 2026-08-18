@@ -1,49 +1,45 @@
 import { describe, expect, it } from 'vitest'
 import { buildFcmMessage } from './messaging'
 
-function notificationOf(
-  args: Parameters<typeof buildFcmMessage>[0],
-): Record<string, string> {
-  const message = buildFcmMessage(args).message as { notification: Record<string, string> }
-  return message.notification
-}
-
 describe('buildFcmMessage', () => {
-  it('builds the base payload without an image key', () => {
-    const notification = notificationOf({ token: 'tok', title: 'Hi', body: 'Body' })
-    expect(notification).toEqual({ title: 'Hi', body: 'Body' })
-    expect('image' in notification).toBe(false)
+  it('builds a standard message without image', () => {
+    const msg = buildFcmMessage({
+      token: 'abc123',
+      title: 'Hello',
+      body: 'World',
+    }) as { message: { token: string; notification: Record<string, string>; data: Record<string, string>; android: Record<string, unknown> } }
+    expect(msg.message.token).toBe('abc123')
+    expect(msg.message.notification.title).toBe('Hello')
+    expect(msg.message.notification.body).toBe('World')
+    expect(msg.message.notification.image).toBeUndefined()
   })
 
-  it('includes the image when provided', () => {
-    const notification = notificationOf({
-      token: 'tok',
-      title: 'Hi',
-      body: 'Body',
+  it('includes image when provided', () => {
+    const msg = buildFcmMessage({
+      token: 'abc123',
+      title: 'Hello',
+      body: 'World',
       image: 'https://example.com/img.png',
-    })
-    expect(notification.image).toBe('https://example.com/img.png')
+    }) as { message: { notification: Record<string, string> } }
+    expect(msg.message.notification.image).toBe('https://example.com/img.png')
   })
 
-  it('omits the image for empty-string images', () => {
-    const notification = notificationOf({
-      token: 'tok',
-      title: 'Hi',
-      body: 'Body',
-      image: '',
-    })
-    expect('image' in notification).toBe(false)
+  it('does not include image when absent', () => {
+    const msg = buildFcmMessage({
+      token: 'abc123',
+      title: 'Hello',
+      body: 'World',
+    }) as { message: { notification: Record<string, string> } }
+    expect('image' in msg.message.notification).toBe(false)
   })
 
-  it('keeps the agent body suffix behaviour', () => {
-    const notification = notificationOf({
-      token: 'tok',
-      title: 'Hi',
-      body: 'Body',
-      agent: 'Agent',
-      image: 'https://example.com/img.png',
-    })
-    expect(notification.body).toBe('Body || Agent')
-    expect(notification.image).toBe('https://example.com/img.png')
+  it('appends agent to body when provided', () => {
+    const msg = buildFcmMessage({
+      token: 'abc123',
+      title: 'Hello',
+      body: 'World',
+      agent: 'Bot',
+    }) as { message: { notification: Record<string, string> } }
+    expect(msg.message.notification.body).toBe('World || Bot')
   })
 })

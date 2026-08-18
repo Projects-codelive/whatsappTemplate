@@ -479,6 +479,8 @@ export interface NotificationSendResult {
   sent: number;
   failed: number;
   failedUsers: string[];
+  /** Campaign id — present when reporting is enabled. */
+  campaignId?: string;
 }
 
 /** Result of a Sync Users run, including the FCM-token backfill and
