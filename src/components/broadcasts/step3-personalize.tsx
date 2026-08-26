@@ -12,13 +12,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { ArrowLeft, ArrowRight, Eye, Loader2 } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Eye, Loader2, Upload, X, Image } from 'lucide-react';
 import {
   extractPlaceholders,
   formatPlaceholderLabel,
   isNumericPlaceholderKey,
   placeholderKey,
 } from '@/lib/whatsapp/template-variables';
+import { uploadImageToStorage } from '@/lib/whatsapp/upload-media';
 
 type VariableType = 'static' | 'field' | 'custom_field';
 
@@ -31,6 +32,8 @@ interface Step3Props {
   template: MessageTemplate;
   variables: Record<string, VariableMapping>;
   onUpdate: (variables: Record<string, VariableMapping>) => void;
+  headerImageUrl: string;
+  onHeaderImageChange: (url: string) => void;
   onNext: () => void;
   onBack: () => void;
 }
@@ -57,6 +60,8 @@ export function Step3Personalize({
   template,
   variables,
   onUpdate,
+  headerImageUrl,
+  onHeaderImageChange,
   onNext,
   onBack,
 }: Step3Props) {
@@ -67,9 +72,9 @@ export function Step3Personalize({
     Map<string, string>
   >(new Map());
   const [loadingPreview, setLoadingPreview] = useState(true);
+  const [uploadingHeader, setUploadingHeader] = useState(false);
+  const [headerUploadError, setHeaderUploadError] = useState<string | null>(null);
 
-  // Load user's custom fields + a representative contact for the
-  // live preview. Fall back to sample data if no contacts exist yet.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -115,12 +120,6 @@ export function Step3Personalize({
     return extractPlaceholders(template.body_text);
   }, [template.body_text]);
 
-  /**
-   * A placeholder is "unmapped" if the user hasn't picked either a
-   * static value or a field/custom-field source. Blocks Next until
-   * every placeholder has something — otherwise the broadcast would
-   * ship with empty strings and confuse recipients.
-   */
   const unmappedKeys = useMemo(() => {
     const missing: string[] = [];
     for (const placeholder of placeholders) {
@@ -134,18 +133,31 @@ export function Step3Personalize({
   }, [placeholders, variables]);
 
   function updateVariable(key: string, patch: Partial<VariableMapping>) {
-    const current = variables[key] ?? { type: 'static' as VariableType, value: '' };
+    const current = variables[key] ?? {
+      type: 'static' as VariableType,
+      value: '',
+    };
     onUpdate({
       ...variables,
       [key]: { ...current, ...patch },
     });
   }
 
-  /**
-   * Substitute placeholders using the first real contact where
-   * possible. {{token}} maps to the variable key of the same name
-   * ("{{1}}" → "1", "{{customer_name}}" → "customer_name").
-   */
+  async function handleHeaderImageUpload(file: File) {
+    setUploadingHeader(true);
+    setHeaderUploadError(null);
+    try {
+      const url = await uploadImageToStorage(file);
+      onHeaderImageChange(url);
+    } catch (err) {
+      setHeaderUploadError(
+        err instanceof Error ? err.message : 'Image upload failed',
+      );
+    } finally {
+      setUploadingHeader(false);
+    }
+  }
+
   const previewText = useMemo(() => {
     const contact = firstContact ?? SAMPLE_CONTACT;
     const customValues = firstContact
@@ -191,13 +203,85 @@ export function Step3Personalize({
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-lg font-semibold text-white">Personalize Message</h2>
+        <h2 className="text-lg font-semibold text-white">
+          Personalize Message
+        </h2>
         <p className="mt-1 text-sm text-slate-400">
           Map template variables to contact fields, custom fields, or static
-          values.
+          values. Optionally add a header image.
         </p>
       </div>
 
+      {/* Header Image — optional, above placeholders */}
+      <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <Image className="h-4 w-4 text-slate-400" />
+          <p className="text-sm font-medium text-white">Header Image</p>
+          <span className="text-xs text-slate-500">(optional)</span>
+        </div>
+
+        <div className="space-y-2">
+          <label
+            className={`flex cursor-pointer items-center gap-2 rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 transition-colors hover:bg-slate-700 ${uploadingHeader ? 'pointer-events-none opacity-60' : ''}`}
+          >
+            {uploadingHeader ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Upload className="h-3.5 w-3.5" />
+            )}
+            {uploadingHeader ? 'Uploading...' : 'Upload Image (JPEG / PNG)'}
+            <input
+              type="file"
+              accept="image/jpeg,image/png"
+              className="hidden"
+              disabled={uploadingHeader}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) handleHeaderImageUpload(file);
+              }}
+            />
+          </label>
+
+          <Input
+            value={headerImageUrl}
+            onChange={(e) => {
+              onHeaderImageChange(e.target.value);
+              setHeaderUploadError(null);
+            }}
+            placeholder="Or paste a public image URL..."
+            className="border-slate-700 bg-slate-800 text-white placeholder:text-slate-500"
+          />
+
+          {headerUploadError && (
+            <p className="text-xs text-red-400">{headerUploadError}</p>
+          )}
+
+          {headerImageUrl && (
+            <div className="relative inline-block">
+              <img
+                src={headerImageUrl}
+                alt="Header preview"
+                className="h-24 w-auto rounded-md border border-slate-700 object-cover"
+                onError={(e) => {
+                  (e.target as HTMLImageElement).style.display = 'none';
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  onHeaderImageChange('');
+                  setHeaderUploadError(null);
+                }}
+                className="absolute -right-1.5 -top-1.5 rounded-full bg-slate-700 p-0.5 text-slate-300 hover:bg-slate-600"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Body placeholder mappings */}
       {placeholders.length === 0 ? (
         <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-6 text-center">
           <p className="text-sm text-slate-400">
@@ -216,7 +300,7 @@ export function Step3Personalize({
                 className="rounded-xl border border-slate-800 bg-slate-900/50 p-4"
               >
                 <div className="mb-3 flex items-center gap-2">
-                  <span className="inline-flex items-center rounded-md bg-primary/10 px-2 py-0.5 text-xs font-mono font-medium text-primary">
+                  <span className="bg-primary/10 text-primary inline-flex items-center rounded-md px-2 py-0.5 font-mono text-xs font-medium">
                     {formatPlaceholderLabel(key)}
                   </span>
                   {!isNumericPlaceholderKey(key) && (
@@ -257,6 +341,7 @@ export function Step3Personalize({
                     <label className="mb-1.5 block text-xs font-medium text-slate-400">
                       {mapping.type === 'static' ? 'Value' : 'Field'}
                     </label>
+
                     {mapping.type === 'static' ? (
                       <Input
                         value={mapping.value}
@@ -319,20 +404,29 @@ export function Step3Personalize({
         </div>
       )}
 
-      {/* Live Preview — rendered as a WhatsApp-style bubble so the user
-          sees approximately what the recipient will see. */}
+      {/* Live Preview */}
       <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
         <div className="mb-3 flex items-center gap-2">
-          <Eye className="h-4 w-4 text-primary" />
+          <Eye className="text-primary h-4 w-4" />
           <p className="text-sm font-medium text-white">Live Preview</p>
           <span className="text-xs text-slate-500">({previewLabel})</span>
           {loadingPreview && (
-            <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+            <Loader2 className="text-primary h-3.5 w-3.5 animate-spin" />
           )}
         </div>
         <div className="rounded-lg bg-[#0e1a12] p-3">
-          <div className="ml-auto max-w-[85%] rounded-lg bg-primary/30 px-3 py-2 shadow-sm">
-            <p className="whitespace-pre-wrap text-sm text-primary">
+          <div className="bg-primary/30 ml-auto max-w-[85%] rounded-lg px-3 py-2 shadow-sm">
+            {headerImageUrl && (
+              <img
+                src={headerImageUrl}
+                alt="Template header"
+                className="mb-2 w-full rounded-md object-cover"
+                onError={(e) => {
+                  (e.target as HTMLImageElement).style.display = 'none';
+                }}
+              />
+            )}
+            <p className="text-primary text-sm whitespace-pre-wrap">
               {previewText}
             </p>
           </div>

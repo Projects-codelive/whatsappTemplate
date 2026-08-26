@@ -42,11 +42,6 @@ interface MetaErrorResponse {
 
 /**
  * Throws a Meta API error without discarding any diagnostic fields.
- * The complete response is logged structured; the thrown Error carries
- * the fields as labelled lines so downstream sinks (Vercel logs,
- * broadcast_recipients.error_message) retain the full reason. The
- * original `error.message` text is kept verbatim on the first line so
- * substring-based checks (isRecipientNotAllowedError) keep working.
  */
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback
@@ -96,8 +91,7 @@ export interface VerifyPhoneNumberArgs {
 }
 
 /**
- * Verify a Meta phone number ID by fetching its public metadata
- * (display_phone_number, verified_name, quality_rating).
+ * Verify a Meta phone number ID by fetching its public metadata.
  */
 export async function verifyPhoneNumber(
   args: VerifyPhoneNumberArgs
@@ -122,14 +116,11 @@ export interface SendTextMessageArgs {
   accessToken: string
   to: string
   text: string
-  /** Meta's message_id of the message being replied to. Adds a `context` field
-   *  so WhatsApp renders the new message as a reply with a quote preview. */
   contextMessageId?: string
 }
 
 /**
  * Send a free-form WhatsApp text message.
- * Only works inside the 24-hour customer service window.
  */
 export async function sendTextMessage(
   args: SendTextMessageArgs
@@ -168,21 +159,34 @@ export interface SendTemplateMessageArgs {
   templateName: string
   language?: string
   /**
-   * Ordered resolved placeholder values.
-   *
-   * Prefer `TemplateVariableValue[]` ({ key, value }) — the key drives
-   * the Meta payload: named keys emit `parameter_name`, numeric keys stay
-   * bare. Legacy positional `string[]` is still accepted and emitted as
-   * bare `{ type: "text", text }` parameters, exactly as before.
+   * Ordered resolved body placeholder values — always text.
+   * Supports TemplateVariableValue[] or legacy string[].
    */
   params?: TemplateVariableValue[] | string[]
-  /** Meta's message_id of the message being replied to. */
+  /**
+   * Optional public image URL sent as a header component.
+   * Only emitted when templateHeaderType is "image".
+   */
+  headerImageUrl?: string
+  /**
+   * The template's header type from message_templates.header_type.
+   * Controls whether header params are emitted and what type they use.
+   * Only "image" sends image params; text/video/document/null skip the header.
+   */
+  templateHeaderType?: 'text' | 'image' | 'video' | 'document' | null
   contextMessageId?: string
 }
 
 /**
- * Send a pre-approved WhatsApp message template. Required outside
- * the 24-hour window and for any first-touch messaging.
+ * Send a pre-approved WhatsApp message template.
+ *
+ * Components are built from two independent sources:
+ *   - header: optional image via `headerImageUrl`, only when
+ *     `templateHeaderType === "image"`
+ *   - body:   text params from `params`, named placeholders emit
+ *     `parameter_name`, positional do not
+ *
+ * Header image is completely decoupled from body params.
  */
 export async function sendTemplateMessage(
   args: SendTemplateMessageArgs
@@ -194,6 +198,8 @@ export async function sendTemplateMessage(
     templateName,
     language = 'en_US',
     params,
+    headerImageUrl,
+    templateHeaderType,
     contextMessageId,
   } = args
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
@@ -203,14 +209,36 @@ export async function sendTemplateMessage(
     language: { code: language },
   }
 
-  const keyedParams = normalizeTemplateParameters(params)
+  const components: Record<string, unknown>[] = []
+
+  // ── Header component (image) ───────────────────────────────────
+  // Only added when a public image URL is provided AND the template
+  // actually has an IMAGE header type. Sending image params for a
+  // text/video/document/null header causes Meta's #100 Invalid parameter.
+  if (headerImageUrl && templateHeaderType === 'image') {
+    components.push({
+      type: 'header',
+      parameters: [
+        {
+          type: 'image',
+          image: { link: headerImageUrl },
+        },
+      ],
+    })
+  }
+
+  // ── Body component (text params only) ─────────────────────────
+  // Always positional, never mixed with header logic.
+  const keyedParams = normalizeTemplateParameters(params as TemplateVariableValue[] | string[] | undefined)
   if (keyedParams && keyedParams.length > 0) {
-    template.components = [
-      {
-        type: 'body',
-        parameters: buildBodyParameters(keyedParams),
-      },
-    ]
+    components.push({
+      type: 'body',
+      parameters: buildBodyParameters(keyedParams),
+    })
+  }
+
+  if (components.length > 0) {
+    template.components = components
   }
 
   const body: Record<string, unknown> = {
@@ -224,9 +252,9 @@ export async function sendTemplateMessage(
     body.context = { message_id: contextMessageId }
   }
 
-  console.log("========== META PAYLOAD ==========");
-  console.log(JSON.stringify(body, null, 2));
-  console.log("==================================");
+  console.log('========== META PAYLOAD ==========')
+  console.log(JSON.stringify(body, null, 2))
+  console.log('==================================')
 
   const response = await fetch(url, {
     method: 'POST',
@@ -237,11 +265,11 @@ export async function sendTemplateMessage(
     body: JSON.stringify(body),
   })
 
-  const responseForLog = response.clone();
-  const responseText = await responseForLog.text().catch(() => '(unreadable)');
-  console.log("========== META RESPONSE ==========");
-  console.log(responseText);
-  console.log("==================================");
+  const responseForLog = response.clone()
+  const responseText = await responseForLog.text().catch(() => '(unreadable)')
+  console.log('========== META RESPONSE ==========')
+  console.log(responseText)
+  console.log('==================================')
 
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
@@ -258,15 +286,12 @@ export interface SendReactionMessageArgs {
   phoneNumberId: string
   accessToken: string
   to: string
-  /** Meta's message_id of the message being reacted to. */
   targetMessageId: string
-  /** Single emoji, or empty string to remove an existing reaction. */
   emoji: string
 }
 
 /**
  * Send a reaction (or removal) to a previously-exchanged message.
- * Empty `emoji` removes the reaction per Meta's spec.
  */
 export async function sendReactionMessage(
   args: SendReactionMessageArgs
@@ -297,20 +322,7 @@ export async function sendReactionMessage(
 // ============================================================
 // Interactive (button replies + list messages)
 // ============================================================
-//
-// Meta's two flavours of interactive message — used by the Flows
-// engine to drive scripted chatbot menus. Caller passes plain
-// JS values; helpers shape the Meta payload and enforce Meta's
-// limits BEFORE the network call so the failure mode is a
-// developer-facing error rather than a customer-facing one.
 
-/**
- * Meta limits for interactive messages, hard-coded so violations
- * fail at build/save time rather than as a 400 from the Meta API
- * mid-conversation. See:
- *   https://developers.facebook.com/docs/whatsapp/cloud-api/messages/interactive-reply-buttons-messages
- *   https://developers.facebook.com/docs/whatsapp/cloud-api/messages/interactive-list-messages
- */
 export const INTERACTIVE_LIMITS = {
   maxButtons: 3,
   buttonTitleMaxLength: 20,
@@ -324,9 +336,7 @@ export const INTERACTIVE_LIMITS = {
 } as const
 
 export interface InteractiveButton {
-  /** Stable id sent back in the webhook when tapped (≤ 256 chars). */
   id: string
-  /** Visible label (≤ 20 chars per Meta). */
   title: string
 }
 
@@ -334,26 +344,13 @@ export interface SendInteractiveButtonsArgs {
   phoneNumberId: string
   accessToken: string
   to: string
-  /** The body text — what the customer reads above the buttons. */
   bodyText: string
-  /** Optional plain-text header (≤ 60 chars). */
   headerText?: string
-  /** Optional grey footer line under the buttons (≤ 60 chars). */
   footerText?: string
-  /** 1–3 buttons. Validated against Meta's limits before sending. */
   buttons: InteractiveButton[]
-  /** Meta's message_id of the message being replied to (quote preview). */
   contextMessageId?: string
 }
 
-/**
- * Send an interactive message with up to 3 inline reply buttons. The
- * customer taps one and Meta delivers a webhook with
- * `messages[0].interactive.button_reply.id` set to the matching button.id.
- *
- * Validation throws BEFORE the network call so misconfigured flows
- * fail at save time, not during a live conversation.
- */
 export async function sendInteractiveButtons(
   args: SendInteractiveButtonsArgs
 ): Promise<MetaSendResult> {
@@ -417,16 +414,12 @@ export async function sendInteractiveButtons(
 }
 
 export interface InteractiveListRow {
-  /** Stable id sent back in the webhook when tapped (≤ 200 chars). */
   id: string
-  /** Visible row title (≤ 24 chars per Meta). */
   title: string
-  /** Optional secondary line shown under the title (≤ 72 chars). */
   description?: string
 }
 
 export interface InteractiveListSection {
-  /** Optional section header shown above its rows. */
   title?: string
   rows: InteractiveListRow[]
 }
@@ -436,24 +429,13 @@ export interface SendInteractiveListArgs {
   accessToken: string
   to: string
   bodyText: string
-  /** Label of the tap-to-expand button on the message bubble. */
   buttonLabel: string
   headerText?: string
   footerText?: string
-  /**
-   * 1–10 rows TOTAL across all sections. Meta caps the *total*, not
-   * per-section. Validation enforces this before send.
-   */
   sections: InteractiveListSection[]
   contextMessageId?: string
 }
 
-/**
- * Send an interactive message with a tap-to-expand list of selectable
- * rows. Use when there are more options than the 3-button limit allows.
- * Webhook arrives with `messages[0].interactive.list_reply.id` set to
- * the matching row.id.
- */
 export async function sendInteractiveList(
   args: SendInteractiveListArgs
 ): Promise<MetaSendResult> {
@@ -582,10 +564,6 @@ export interface GetMediaUrlArgs {
   accessToken: string
 }
 
-/**
- * Resolve a media ID to Meta's (short-lived, authenticated) CDN URL
- * plus the MIME type. Step one of the media-proxy flow.
- */
 export async function getMediaUrl(
   args: GetMediaUrlArgs
 ): Promise<{ url: string; mimeType: string }> {
@@ -606,10 +584,6 @@ export interface DownloadMediaArgs {
   accessToken: string
 }
 
-/**
- * Fetch the binary bytes for a media URL obtained from getMediaUrl.
- * Step two of the media-proxy flow.
- */
 export async function downloadMedia(
   args: DownloadMediaArgs
 ): Promise<{ buffer: Buffer; contentType: string }> {

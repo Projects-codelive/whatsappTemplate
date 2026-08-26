@@ -43,6 +43,7 @@ interface BroadcastPayload {
   template: MessageTemplate;
   audience: AudienceConfig;
   variables: Record<string, VariableMapping>;
+  headerImageUrl?: string;
 }
 
 interface UseBroadcastSendingReturn {
@@ -151,6 +152,7 @@ export function resolveVariables(
 
   return keys.map((key) => {
     const v = variables[key];
+
     if (v.type === 'static') return { key, value: v.value };
 
     if (v.type === 'field') {
@@ -261,10 +263,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
    * we need real contacts.id UUIDs. So: look up each CSV phone in the
    * caller's contacts table; insert any that don't exist; return the
    * resolved set.
-   *
-   * Pre-existing implementation synthesized `csv-N` strings as
-   * contact_id, which failed the UUID cast on insert — every CSV
-   * broadcast silently created zero recipients.
    */
   async function upsertCsvContacts(
     supabase: ReturnType<typeof createClient>,
@@ -302,8 +300,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       if (c.phone) byPhone.set(c.phone, c);
     }
 
-    // Insert only missing contacts, in one batch per 200 rows (PostgREST
-    // has a default payload cap — 200 keeps individual requests small).
     const missing = phones
       .filter((p) => !byPhone.has(p))
       .map((phone) => ({
@@ -327,7 +323,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       }
     }
 
-    // Preserve input order so analytics roughly matches the CSV order.
     return phones
       .map((p) => byPhone.get(p))
       .filter((c): c is Contact => Boolean(c));
@@ -339,9 +334,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
   ): Promise<Contact[]> {
     const { fieldId, operator, value } = filter;
 
-    // Build the WHERE clause for the operator. PostgREST supports
-    // eq/neq/ilike via the query builder — use ilike with wildcards
-    // for "contains" so the match is case-insensitive.
     let query = supabase
       .from('contact_custom_values')
       .select('contact_id')
@@ -374,10 +366,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
     try {
       // ── Step 0: Resolve current user ──────────────────────────────
-      // broadcasts.user_id is NOT NULL + guarded by RLS
-      // (auth.uid() = user_id). Without this, the INSERT below was
-      // silently failing with 23502 / 42501 — the wizard would
-      // no-op with no feedback.
       const {
         data: { session },
       } = await supabase.auth.getSession();
@@ -441,11 +429,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           .from('broadcast_recipients')
           .insert(batch);
         if (recipientError) {
-          // Previous impl logged and marched on — the broadcast then ran
-          // with an incomplete recipient set, so webhook status updates
-          // couldn't find some rows and the aggregate counts drifted.
-          // Flip the broadcast to failed so the user sees the problem
-          // immediately, then throw to abort the send loop.
           await supabase
             .from('broadcasts')
             .update({
@@ -470,15 +453,10 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         throw new Error('Failed to fetch broadcast recipients');
       }
 
-      // One bulk fetch of custom values for every contact in this
-      // broadcast, avoiding N+1 during the send loop.
       const contactIds = recipients
         .map((r) => r.contact?.id)
         .filter((id): id is string => Boolean(id));
-      const customValueIndex = await fetchCustomValueIndex(
-        supabase,
-        contactIds,
-      );
+      const customValueIndex = await fetchCustomValueIndex(supabase, contactIds);
 
       let failedCount = 0;
       const totalRecipients = recipients.length;
@@ -510,6 +488,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
               recipients: apiRecipients,
               template_name: payload.template.name,
               template_language: payload.template.language ?? 'en_US',
+              header_image_url: payload.headerImageUrl,
             }),
           });
 
@@ -596,8 +575,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       }
 
       // ── Step 5: Finalize status ───────────────────────────────────
-      // Aggregate counts are maintained by the DB trigger (migration
-      // 003); we only flip the final status here.
       setProgress(95);
       const finalStatus = failedCount === totalRecipients ? 'failed' : 'sent';
       await supabase

@@ -83,6 +83,7 @@ export async function POST(request: Request) {
       template_name,
       template_language,
       template_params,
+      header_image_url,
     } = body
 
     // Normalize to a list of {phone, params} regardless of shape.
@@ -113,6 +114,18 @@ export async function POST(request: Request) {
         { status: 400 }
       )
     }
+
+    // Look up the template's header_type so sendTemplateMessage can
+    // decide whether to emit a header component. Single query, reused
+    // for every recipient in the loop below.
+    const { data: templateRecord } = await supabase
+      .from('message_templates')
+      .select('header_type')
+      .eq('user_id', user.id)
+      .eq('name', template_name)
+      .maybeSingle()
+
+    const templateHeaderType = (templateRecord?.header_type as 'text' | 'image' | 'video' | 'document' | null) ?? null
 
     const { data: config, error: configError } = await supabase
       .from('whatsapp_config')
@@ -164,6 +177,8 @@ export async function POST(request: Request) {
             templateName: template_name,
             language: template_language || 'en_US',
             params: recipient.params ?? [],
+            headerImageUrl: header_image_url || undefined,
+            templateHeaderType,
           })
           sentMessageId = result.messageId
           lastError = null
