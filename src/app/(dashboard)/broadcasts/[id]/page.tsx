@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { Broadcast, BroadcastRecipient, RecipientStatus } from '@/types';
@@ -38,6 +38,8 @@ import {
   getBroadcastStatus,
   getRecipientStatus,
 } from '@/lib/broadcast-status';
+
+const POLL_INTERVAL_MS = 5_000;
 
 interface StatCardProps {
   label: string;
@@ -155,38 +157,62 @@ export default function BroadcastDetailPage() {
   );
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const broadcastIdRef = useRef(broadcastId);
+  broadcastIdRef.current = broadcastId;
+
+  const fetchData = useCallback(async () => {
+    try {
+      const supabase = createClient();
+      const id = broadcastIdRef.current;
+
+      const { data: bc, error: bcError } = await supabase
+        .from('broadcasts')
+        .select('*')
+        .eq('id', id)
+        .single();
+
+      if (bcError) throw bcError;
+      setBroadcast(bc);
+
+      const { data: recs, error: recsError } = await supabase
+        .from('broadcast_recipients')
+        .select('*, contact:contacts(*)')
+        .eq('broadcast_id', id)
+        .order('created_at', { ascending: false });
+
+      if (recsError) throw recsError;
+      setRecipients(recs ?? []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load broadcast');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    async function fetchData() {
-      try {
-        const supabase = createClient();
+    fetchData();
+  }, [fetchData, broadcastId]);
 
-        const { data: bc, error: bcError } = await supabase
-          .from('broadcasts')
-          .select('*')
-          .eq('id', broadcastId)
-          .single();
+  const isSending = broadcast?.status === 'sending';
 
-        if (bcError) throw bcError;
-        setBroadcast(bc);
-
-        const { data: recs, error: recsError } = await supabase
-          .from('broadcast_recipients')
-          .select('*, contact:contacts(*)')
-          .eq('broadcast_id', broadcastId)
-          .order('created_at', { ascending: false });
-
-        if (recsError) throw recsError;
-        setRecipients(recs ?? []);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load broadcast');
-      } finally {
-        setLoading(false);
+  useEffect(() => {
+    if (!isSending) {
+      if (pollTimer.current) {
+        clearInterval(pollTimer.current);
+        pollTimer.current = null;
       }
+      return;
     }
 
-    fetchData();
-  }, [broadcastId]);
+    pollTimer.current = setInterval(fetchData, POLL_INTERVAL_MS);
+    return () => {
+      if (pollTimer.current) {
+        clearInterval(pollTimer.current);
+        pollTimer.current = null;
+      }
+    };
+  }, [isSending, fetchData]);
 
   const filteredRecipients = useMemo(
     () =>

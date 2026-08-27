@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { MessageTemplate } from '@/types';
 import { Button } from '@/components/ui/button';
@@ -17,12 +17,14 @@ interface Step1Props {
   onSelect: (template: MessageTemplate) => void;
   onNext: () => void;
   onBack: () => void;
+  initialTemplateName?: string;
 }
 
-export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack }: Step1Props) {
+export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack, initialTemplateName }: Step1Props) {
   const [templates, setTemplates] = useState<MessageTemplate[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const autoSelectedRef = useRef(false);
 
   useEffect(() => {
     async function fetchTemplates() {
@@ -35,6 +37,14 @@ export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack
 
         if (fetchError) throw fetchError;
         setTemplates(data ?? []);
+
+        if (initialTemplateName && !autoSelectedRef.current) {
+          const match = (data ?? []).find((t) => t.name === initialTemplateName);
+          if (match) {
+            autoSelectedRef.current = true;
+            onSelect(match);
+          }
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load templates');
       } finally {

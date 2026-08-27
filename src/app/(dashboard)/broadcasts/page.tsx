@@ -3,8 +3,9 @@
 import { useEffect, useState, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
-import { Broadcast } from '@/types';
+import { Broadcast, BroadcastStatus } from '@/types';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import {
   Table,
   TableBody,
@@ -13,8 +14,36 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { Radio, Plus, Loader2 } from 'lucide-react';
-import { getBroadcastStatus } from '@/lib/broadcast-status';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
+import { toast } from 'sonner';
+import {
+  Radio,
+  Plus,
+  Loader2,
+  Search,
+  MoreHorizontal,
+  Copy,
+  Trash2,
+  Filter,
+  ChevronDown,
+} from 'lucide-react';
+import { getBroadcastStatus, broadcastStatusConfig } from '@/lib/broadcast-status';
+
+const BROADCAST_STATUSES: BroadcastStatus[] = ['draft', 'scheduled', 'sending', 'sent', 'failed'];
 
 /**
  * Poll cadence while any broadcast is sending. Kept modest so we don't
@@ -60,6 +89,28 @@ export default function BroadcastsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Search & filter
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<BroadcastStatus | 'all'>('all');
+
+  // Bulk selection
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+
+  // Row-level delete confirm
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  // Clear selection when search or filter changes
+  const prevSearchRef = useRef(search);
+  const prevStatusRef = useRef(statusFilter);
+  if (search !== prevSearchRef.current || statusFilter !== prevStatusRef.current) {
+    prevSearchRef.current = search;
+    prevStatusRef.current = statusFilter;
+    if (selectedIds.size > 0) setSelectedIds(new Set());
+  }
+
   // Used to kick off polling only while something is actively sending.
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -84,10 +135,123 @@ export default function BroadcastsPage() {
     fetchBroadcasts();
   }, []);
 
+  const filteredBroadcasts = useMemo(() => {
+    let result = broadcasts;
+    if (statusFilter !== 'all') {
+      result = result.filter((b) => b.status === statusFilter);
+    }
+    if (search.trim()) {
+      const term = search.trim().toLowerCase();
+      result = result.filter(
+        (b) =>
+          b.name.toLowerCase().includes(term) ||
+          b.template_name.toLowerCase().includes(term),
+      );
+    }
+    return result;
+  }, [broadcasts, search, statusFilter]);
+
   const anySending = useMemo(
     () => broadcasts.some((b) => b.status === 'sending'),
     [broadcasts],
   );
+
+  const allVisibleSelected =
+    filteredBroadcasts.length > 0 &&
+    filteredBroadcasts.every((b) => selectedIds.has(b.id));
+
+  const sendingBroadcastCount = useMemo(() => {
+    if (selectedIds.size === 0) return 0;
+    const broadcastMap = new Map(broadcasts.map((b) => [b.id, b]));
+    return Array.from(selectedIds).filter((id) => {
+      const b = broadcastMap.get(id);
+      return b?.status === 'sending';
+    }).length;
+  }, [selectedIds, broadcasts]);
+
+  function toggleSelectAll() {
+    if (allVisibleSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filteredBroadcasts.map((b) => b.id)));
+    }
+  }
+
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function handleClone(broadcast: Broadcast) {
+    const params = new URLSearchParams({
+      template: broadcast.template_name,
+      name: `${broadcast.name} (Copy)`,
+    });
+    if (broadcast.audience_filter) {
+      params.set('audience', JSON.stringify(broadcast.audience_filter));
+    }
+    if (broadcast.template_variables) {
+      params.set('variables', JSON.stringify(broadcast.template_variables));
+    }
+    router.push(`/broadcasts/new?${params.toString()}`);
+  }
+
+  async function handleDeleteSingle(id: string) {
+    setDeleting(true);
+    const supabase = createClient();
+    const { error } = await supabase.from('broadcasts').delete().eq('id', id);
+    setDeleting(false);
+    setDeleteConfirmId(null);
+    if (error) {
+      toast.error(`Delete failed: ${error.message}`);
+      return;
+    }
+    toast.success('Broadcast deleted');
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    fetchBroadcasts();
+  }
+
+  async function handleBulkDelete() {
+    setBulkDeleting(true);
+    const supabase = createClient();
+
+    // Filter out sending broadcasts — they must not be deleted mid-send.
+    const broadcastMap = new Map(broadcasts.map((b) => [b.id, b]));
+    const eligible = Array.from(selectedIds).filter((id) => {
+      const b = broadcastMap.get(id);
+      return b && b.status !== 'sending';
+    });
+
+    if (eligible.length === 0) {
+      setBulkDeleting(false);
+      setBulkDeleteOpen(false);
+      toast.error('Cannot delete broadcasts that are currently sending');
+      return;
+    }
+
+    const { error } = await supabase.from('broadcasts').delete().in('id', eligible);
+    setBulkDeleting(false);
+    setBulkDeleteOpen(false);
+    if (error) {
+      toast.error(`Bulk delete failed: ${error.message}`);
+      return;
+    }
+    const skipped = selectedIds.size - eligible.length;
+    toast.success(
+      `${eligible.length} broadcast${eligible.length === 1 ? '' : 's'} deleted` +
+        (skipped > 0 ? ` (${skipped} sending broadcast${skipped === 1 ? '' : 's'} skipped)` : ''),
+    );
+    setSelectedIds(new Set());
+    fetchBroadcasts();
+  }
 
   useEffect(() => {
     function startPolling() {
@@ -146,8 +310,7 @@ export default function BroadcastsPage() {
 
   return (
     <div className="space-y-6">
-      {/* Top indeterminate progress bar: only visible while a broadcast
-          is mid-send. Pure CSS animation so no extra deps. */}
+      {/* Top indeterminate progress bar */}
       {anySending && (
         <div
           role="progressbar"
@@ -174,7 +337,8 @@ export default function BroadcastsPage() {
         </div>
       )}
 
-      <div className="flex items-center justify-between">
+      {/* Header */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold text-white">Broadcasts</h1>
           <p className="mt-1 text-sm text-slate-400">
@@ -189,6 +353,80 @@ export default function BroadcastsPage() {
           New Broadcast
         </Button>
       </div>
+
+      {/* Search & Filter bar — only shown when there are broadcasts */}
+      {broadcasts.length > 0 && (
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+          <div className="relative max-w-sm flex-1">
+            <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+            <Input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search by name or template..."
+              className="border-slate-700 bg-slate-900 pl-8 text-white placeholder:text-slate-500"
+            />
+          </div>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="border-slate-700 text-slate-300 hover:bg-slate-800"
+                />
+              }
+            >
+              <Filter className="h-3.5 w-3.5" />
+              {statusFilter === 'all'
+                ? 'All statuses'
+                : broadcastStatusConfig[statusFilter].label}
+              <ChevronDown className="h-3 w-3" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent className="border-slate-700 bg-slate-900">
+              <DropdownMenuItem
+                onClick={() => setStatusFilter('all')}
+                className={statusFilter === 'all' ? 'text-primary' : 'text-slate-300'}
+              >
+                All statuses
+              </DropdownMenuItem>
+              {BROADCAST_STATUSES.map((s) => (
+                <DropdownMenuItem
+                  key={s}
+                  onClick={() => setStatusFilter(s)}
+                  className={statusFilter === s ? 'text-primary' : 'text-slate-300'}
+                >
+                  {broadcastStatusConfig[s].label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      )}
+
+      {/* Bulk actions toolbar */}
+      {selectedIds.size > 0 && (
+        <div className="flex items-center gap-3 rounded-lg border border-red-500/20 bg-red-500/5 px-4 py-2.5">
+          <span className="text-sm text-slate-300">
+            {selectedIds.size} selected
+            {sendingBroadcastCount > 0 && (
+              <span className="ml-1 text-yellow-400">
+                ({sendingBroadcastCount} sending — will be skipped)
+              </span>
+            )}
+          </span>
+          <div className="ml-auto">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setBulkDeleteOpen(true)}
+              className="border-red-500/30 bg-transparent text-red-400 hover:bg-red-500/10"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              Delete selected
+            </Button>
+          </div>
+        </div>
+      )}
 
       {broadcasts.length === 0 ? (
         <div className="flex h-64 flex-col items-center justify-center rounded-xl border border-slate-800 bg-slate-900">
@@ -205,11 +443,25 @@ export default function BroadcastsPage() {
             New Broadcast
           </Button>
         </div>
+      ) : filteredBroadcasts.length === 0 ? (
+        <div className="flex h-32 items-center justify-center rounded-xl border border-slate-800 bg-slate-900">
+          <p className="text-sm text-slate-400">
+            No broadcasts match your search or filter.
+          </p>
+        </div>
       ) : (
         <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-900">
           <Table>
             <TableHeader>
               <TableRow className="border-slate-800 hover:bg-transparent">
+                <TableHead className="w-10">
+                  <input
+                    type="checkbox"
+                    checked={allVisibleSelected}
+                    onChange={toggleSelectAll}
+                    className="h-4 w-4 rounded border-slate-600 bg-slate-800 accent-primary"
+                  />
+                </TableHead>
                 <TableHead className="text-slate-400">Name</TableHead>
                 <TableHead className="hidden text-slate-400 md:table-cell">Template</TableHead>
                 <TableHead className="hidden text-right text-slate-400 sm:table-cell">
@@ -219,17 +471,27 @@ export default function BroadcastsPage() {
                 <TableHead className="hidden text-slate-400 lg:table-cell">Read</TableHead>
                 <TableHead className="text-slate-400">Status</TableHead>
                 <TableHead className="hidden text-slate-400 sm:table-cell">Date</TableHead>
+                <TableHead className="w-10" />
               </TableRow>
             </TableHeader>
             <TableBody>
-              {broadcasts.map((broadcast) => {
+              {filteredBroadcasts.map((broadcast) => {
                 const status = getBroadcastStatus(broadcast.status);
+                const deleteConfirm = deleteConfirmId === broadcast.id;
                 return (
                   <TableRow
                     key={broadcast.id}
                     className="cursor-pointer border-slate-800 hover:bg-slate-800/50"
                     onClick={() => router.push(`/broadcasts/${broadcast.id}`)}
                   >
+                    <TableCell onClick={(e) => e.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(broadcast.id)}
+                        onChange={() => toggleSelect(broadcast.id)}
+                        className="h-4 w-4 rounded border-slate-600 bg-slate-800 accent-primary"
+                      />
+                    </TableCell>
                     <TableCell className="font-medium text-white">
                       {broadcast.name}
                     </TableCell>
@@ -269,6 +531,64 @@ export default function BroadcastsPage() {
                     <TableCell className="hidden text-slate-400 sm:table-cell">
                       {new Date(broadcast.created_at).toLocaleDateString()}
                     </TableCell>
+                    <TableCell onClick={(e) => e.stopPropagation()}>
+                      {deleteConfirm ? (
+                        <div className="flex items-center gap-1">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setDeleteConfirmId(null)}
+                            disabled={deleting}
+                            className="h-6 border-slate-700 bg-transparent px-1.5 text-[10px] text-slate-400 hover:bg-slate-800"
+                          >
+                            Cancel
+                          </Button>
+                          <Button
+                            size="sm"
+                            onClick={() => handleDeleteSingle(broadcast.id)}
+                            disabled={deleting}
+                            className="h-6 bg-red-600 px-1.5 text-[10px] text-white hover:bg-red-700 disabled:opacity-50"
+                          >
+                            {deleting ? '...' : 'Confirm'}
+                          </Button>
+                        </div>
+                      ) : (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger
+                            render={
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                className="text-slate-400 hover:text-white"
+                              />
+                            }
+                          >
+                            <MoreHorizontal className="h-4 w-4" />
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent
+                            align="end"
+                            className="border-slate-700 bg-slate-900"
+                          >
+                            <DropdownMenuItem
+                              onClick={() => handleClone(broadcast)}
+                              className="text-slate-300 focus:bg-slate-800 focus:text-white"
+                            >
+                              <Copy className="h-4 w-4" />
+                              Clone
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator className="bg-slate-700" />
+                            <DropdownMenuItem
+                              variant="destructive"
+                              onClick={() => setDeleteConfirmId(broadcast.id)}
+                              disabled={broadcast.status === 'sending'}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                              Delete
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      )}
+                    </TableCell>
                   </TableRow>
                 );
               })}
@@ -276,6 +596,50 @@ export default function BroadcastsPage() {
           </Table>
         </div>
       )}
+
+      {/* Bulk delete confirmation dialog */}
+      <Dialog open={bulkDeleteOpen} onOpenChange={setBulkDeleteOpen}>
+        <DialogContent className="border-slate-700 bg-slate-900 text-slate-200 sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="text-white">Delete Broadcasts</DialogTitle>
+            <DialogDescription className="text-slate-400">
+              {sendingBroadcastCount > 0 ? (
+                <>
+                  Delete {selectedIds.size - sendingBroadcastCount} broadcast
+                  {selectedIds.size - sendingBroadcastCount === 1 ? '' : 's'}?
+                  {sendingBroadcastCount} sending broadcast
+                  {sendingBroadcastCount === 1 ? '' : 's'} will be skipped.
+                  This action cannot be undone.
+                </>
+              ) : (
+                <>
+                  Are you sure you want to delete {selectedIds.size} broadcast
+                  {selectedIds.size === 1 ? '' : 's'}? This action cannot be undone.
+                </>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="border-slate-700 bg-slate-900">
+            <Button
+              variant="outline"
+              onClick={() => setBulkDeleteOpen(false)}
+              disabled={bulkDeleting}
+              className="border-slate-700 text-slate-300 hover:bg-slate-800"
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleBulkDelete}
+              disabled={bulkDeleting || selectedIds.size - sendingBroadcastCount === 0}
+            >
+              {bulkDeleting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Delete {selectedIds.size - sendingBroadcastCount} broadcast
+              {selectedIds.size - sendingBroadcastCount === 1 ? '' : 's'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

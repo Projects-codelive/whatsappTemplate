@@ -1,7 +1,7 @@
 'use client';
 
-import { useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useEffect, useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { toast } from 'sonner';
 import { MessageTemplate } from '@/types';
@@ -19,28 +19,67 @@ const steps = [
   { label: 'Send', key: 'send' },
 ] as const;
 
+type AudienceState = {
+  type: 'all' | 'tags' | 'custom_field' | 'csv';
+  tagIds?: string[];
+  customField?: {
+    fieldId: string;
+    operator: 'is' | 'is_not' | 'contains';
+    value: string;
+  };
+  csvContacts?: { phone: string; name?: string }[];
+  excludeTagIds?: string[];
+};
+
+function safeParseJson<T>(raw: string | null, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 export default function NewBroadcastPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { createAndSendBroadcast, isProcessing, progress } = useBroadcastSending();
 
   const [currentStep, setCurrentStep] = useState(0);
   const [template, setTemplate] = useState<MessageTemplate | null>(null);
-  const [audience, setAudience] = useState<{
-    type: 'all' | 'tags' | 'custom_field' | 'csv';
-    tagIds?: string[];
-    customField?: {
-      fieldId: string;
-      operator: 'is' | 'is_not' | 'contains';
-      value: string;
-    };
-    csvContacts?: { phone: string; name?: string }[];
-    excludeTagIds?: string[];
-  }>({ type: 'all' });
+  const [audience, setAudience] = useState<AudienceState>({ type: 'all' });
   const [variables, setVariables] = useState<
     Record<string, { type: 'static' | 'field' | 'custom_field'; value: string }>
   >({});
   const [headerImageUrl, setHeaderImageUrl] = useState('');
   const [name, setName] = useState('');
+
+  // Clone: apply search params once templates are loaded.
+  const cloneApplied = useRef(false);
+
+  useEffect(() => {
+    if (cloneApplied.current) return;
+
+    const cloneName = searchParams.get('name');
+    const cloneTemplate = searchParams.get('template');
+    if (!cloneTemplate) return;
+
+    cloneApplied.current = true;
+
+    if (cloneName) setName(cloneName);
+    setAudience(
+      safeParseJson<AudienceState>(searchParams.get('audience'), { type: 'all' }),
+    );
+    setVariables(
+      safeParseJson(searchParams.get('variables'), {}),
+    );
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (cloneApplied.current && template) {
+      setCurrentStep(1);
+    }
+  }, [template]);
 
   async function handleSend() {
     if (!template) return;
@@ -91,6 +130,9 @@ export default function NewBroadcastPage() {
       audience_filter: {
         type: audience.type,
         tagIds: audience.tagIds,
+        customField: audience.customField,
+        csvContacts: audience.csvContacts,
+        excludeTagIds: audience.excludeTagIds,
       },
       status: 'draft',
       total_recipients: 0,
@@ -174,6 +216,7 @@ export default function NewBroadcastPage() {
               onSelect={setTemplate}
               onNext={() => setCurrentStep(1)}
               onBack={() => router.push('/broadcasts')}
+              initialTemplateName={searchParams.get('template') ?? undefined}
             />
           )}
           {currentStep === 1 && (
