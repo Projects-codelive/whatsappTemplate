@@ -9,7 +9,8 @@
  * instead of a runtime rejection from Meta.
  */
 
-import type { TemplateVariableValue } from './template-variables'
+import type { MessageTemplateHeaderType } from '@/types'
+import type { TemplateVariableValue, TemplateBodyParameter } from './template-variables'
 import {
   buildBodyParameters,
   normalizeTemplateParameters,
@@ -169,24 +170,51 @@ export interface SendTemplateMessageArgs {
    */
   headerImageUrl?: string
   /**
-   * The template's header type from message_templates.header_type.
-   * Controls whether header params are emitted and what type they use.
-   * Only "image" sends image params; text/video/document/null skip the header.
+   * The template's header format from message_templates.header_type —
+   * the server-side source of truth for what Meta will expect.
+   *   - "image": REQUIRES headerImageUrl; missing ones are rejected
+   *     with a clear validation error BEFORE any network call.
+   *   - "text"/"video"/"document": handled per the template definition;
+   *     never treated as image. A stray selected image is not invented
+   *     into a header component.
+   *   - null/undefined: template has no header — no header component.
    */
-  templateHeaderType?: 'text' | 'image' | 'video' | 'document' | null
+  templateHeaderType?: MessageTemplateHeaderType | null
   contextMessageId?: string
 }
+
+/** Meta header component parameter for an IMAGE header. */
+interface TemplateHeaderImageParameter {
+  type: 'image'
+  image: { link: string }
+}
+
+interface TemplateHeaderComponent {
+  type: 'header'
+  parameters: TemplateHeaderImageParameter[]
+}
+
+interface TemplateBodyComponent {
+  type: 'body'
+  parameters: TemplateBodyParameter[]
+}
+
+type TemplateComponent = TemplateHeaderComponent | TemplateBodyComponent
 
 /**
  * Send a pre-approved WhatsApp message template.
  *
  * Components are built from two independent sources:
- *   - header: optional image via `headerImageUrl`, only when
- *     `templateHeaderType === "image"`
+ *   - header: image via `headerImageUrl`, emitted ONLY when the template
+ *     actually has an IMAGE header (`templateHeaderType === "image"`).
+ *     Templates with no header (null) or a TEXT/video/document header
+ *     never get an image header invented.
  *   - body:   text params from `params`, named placeholders emit
- *     `parameter_name`, positional do not
+ *     `parameter_name`, positional do not.
  *
- * Header image is completely decoupled from body params.
+ * An IMAGE-header template without a header image is rejected locally
+ * (Meta would answer "#132012 … expected IMAGE, received UNKNOWN") so we
+ * never reach the network for a payload we already know is invalid.
  */
 export async function sendTemplateMessage(
   args: SendTemplateMessageArgs
@@ -204,24 +232,34 @@ export async function sendTemplateMessage(
   } = args
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
 
+  if (
+    templateHeaderType === 'image' &&
+    (headerImageUrl ?? '').trim() === ''
+  ) {
+    throw new Error(
+      'This template requires a header image. Please select an image before sending.',
+    )
+  }
+
   const template: Record<string, unknown> = {
     name: templateName,
     language: { code: language },
   }
 
-  const components: Record<string, unknown>[] = []
+  const components: TemplateComponent[] = []
 
   // ── Header component (image) ───────────────────────────────────
-  // Only added when a public image URL is provided AND the template
-  // actually has an IMAGE header type. Sending image params for a
-  // text/video/document/null header causes Meta's #100 Invalid parameter.
-  if (headerImageUrl && templateHeaderType === 'image') {
+  // Only added for templates that actually define an IMAGE header, and
+  // only after the validation above guarantees a non-empty URL. Sending
+  // image params for a text/video/document/null header causes Meta's
+  // #100 Invalid parameter — so a selected image is never forced in.
+  if (templateHeaderType === 'image') {
     components.push({
       type: 'header',
       parameters: [
         {
           type: 'image',
-          image: { link: headerImageUrl },
+          image: { link: headerImageUrl! },
         },
       ],
     })
@@ -241,6 +279,33 @@ export async function sendTemplateMessage(
     template.components = components
   }
 
+  const headerComponent = components.find((c) => c.type === 'header')
+  const bodyComponent = components.find((c) => c.type === 'body')
+  console.log('[meta-api] template send payload', {
+    template: templateName,
+    language,
+    header:
+      headerComponent?.type === 'header'
+        ? {
+            type: 'header',
+            parameterType:
+              (headerComponent.parameters as TemplateHeaderImageParameter[])[0]?.type ??
+              null,
+            imageLink:
+              (headerComponent.parameters as TemplateHeaderImageParameter[])[0]?.image
+                ?.link ?? null,
+          }
+        : null,
+    body:
+      bodyComponent?.type === 'body'
+        ? (bodyComponent.parameters as TemplateBodyParameter[]).map((p) => ({
+            parameter_name:
+              'parameter_name' in p ? p.parameter_name : null,
+            text: p.text,
+          }))
+        : [],
+  })
+
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
@@ -251,10 +316,6 @@ export async function sendTemplateMessage(
   if (contextMessageId) {
     body.context = { message_id: contextMessageId }
   }
-
-  console.log('========== META PAYLOAD ==========')
-  console.log(JSON.stringify(body, null, 2))
-  console.log('==================================')
 
   const response = await fetch(url, {
     method: 'POST',

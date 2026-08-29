@@ -415,3 +415,170 @@ describe("sendTemplateMessage — parameter payload shape", () => {
     expect(body.template.components).toBeUndefined();
   });
 });
+
+describe("sendTemplateMessage — template-aware header handling", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const BASE = {
+    phoneNumberId: "test-phone",
+    accessToken: "test-token",
+    to: "1234567890",
+    templateName: "order_updates_1",
+    language: "en_US",
+  } as const;
+
+  async function captureHeaderPayload(args: {
+    templateHeaderType?: "text" | "image" | "video" | "document" | null;
+    headerImageUrl?: string;
+    params?: { key: string; value: string }[];
+  }) {
+    const captured: { body: unknown } = { body: null };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        captured.body = JSON.parse(String(init.body));
+        return new Response(
+          JSON.stringify({ messages: [{ id: "wamid.H" }] }),
+          { status: 200 },
+        );
+      }),
+    );
+    await sendTemplateMessage({ ...BASE, ...args });
+    return captured.body as {
+      template: { components: { type: string; parameters?: unknown[] }[] };
+    };
+  }
+
+  it("emits an IMAGE header with the selected image link when the template header is IMAGE", async () => {
+    const body = await captureHeaderPayload({
+      templateHeaderType: "image",
+      headerImageUrl: "https://cdn.example.com/header.png",
+      params: [{ key: "order_details", value: "Manish Bhagat" }],
+    });
+
+    expect(body.template.components[0]).toEqual({
+      type: "header",
+      parameters: [
+        {
+          type: "image",
+          image: { link: "https://cdn.example.com/header.png" },
+        },
+      ],
+    });
+    expect(body.template.components[1]).toEqual({
+      type: "body",
+      parameters: [
+        {
+          type: "text",
+          parameter_name: "order_details",
+          text: "Manish Bhagat",
+        },
+      ],
+    });
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["empty string", ""],
+    ["whitespace", "   "],
+  ])(
+    "rejects an IMAGE-header template with %s headerImageUrl before calling Meta",
+    async (_label, headerImageUrl) => {
+      const fetchMock = vi.fn(neverFetch);
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(
+        sendTemplateMessage({
+          ...BASE,
+          templateHeaderType: "image",
+          headerImageUrl,
+          params: [{ key: "order_details", value: "Manish Bhagat" }],
+        }),
+      ).rejects.toThrow(/requires a header image/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("sends a template with no header and no image without a header component", async () => {
+    const body = await captureHeaderPayload({
+      params: [{ key: "customer_name", value: "Manish Bhagat" }],
+    });
+
+    expect(body.template.components).toEqual([
+      {
+        type: "body",
+        parameters: [
+          {
+            type: "text",
+            parameter_name: "customer_name",
+            text: "Manish Bhagat",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("does not invent an IMAGE header when an image is selected for a template with no header", async () => {
+    const body = await captureHeaderPayload({
+      headerImageUrl: "https://cdn.example.com/header.png",
+      params: [{ key: "customer_name", value: "Manish Bhagat" }],
+    });
+
+    expect(
+      body.template.components.filter((c) => c.type === "header"),
+    ).toHaveLength(0);
+    expect(body.template.components).toEqual([
+      {
+        type: "body",
+        parameters: [
+          {
+            type: "text",
+            parameter_name: "customer_name",
+            text: "Manish Bhagat",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("does not treat a TEXT-header template as an IMAGE template", async () => {
+    const body = await captureHeaderPayload({
+      templateHeaderType: "text",
+      headerImageUrl: "https://cdn.example.com/header.png",
+      params: [{ key: "customer_name", value: "Manish Bhagat" }],
+    });
+
+    expect(
+      body.template.components.filter((c) => c.type === "header"),
+    ).toHaveLength(0);
+    let hasImageParam = false;
+    for (const component of body.template.components) {
+      const parameters = component.parameters ?? [];
+      for (const param of parameters) {
+        if ((param as { type?: string }).type === "image") hasImageParam = true;
+      }
+    }
+    expect(hasImageParam).toBe(false);
+  });
+
+  it("preserves parameter_name for named body variables alongside an IMAGE header", async () => {
+    const body = await captureHeaderPayload({
+      templateHeaderType: "image",
+      headerImageUrl: "https://cdn.example.com/header.png",
+      params: [{ key: "order_details", value: "Manish Bhagat" }],
+    });
+
+    expect(body.template.components[1]).toEqual({
+      type: "body",
+      parameters: [
+        {
+          type: "text",
+          parameter_name: "order_details",
+          text: "Manish Bhagat",
+        },
+      ],
+    });
+  });
+});

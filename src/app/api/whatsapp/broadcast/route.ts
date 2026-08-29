@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
 import type { TemplateVariableValue } from '@/lib/whatsapp/template-variables'
+import type { MessageTemplateHeaderType } from '@/types'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   sanitizePhoneForMeta,
@@ -115,17 +116,47 @@ export async function POST(request: Request) {
       )
     }
 
-    // Look up the template's header_type so sendTemplateMessage can
-    // decide whether to emit a header component. Single query, reused
-    // for every recipient in the loop below.
-    const { data: templateRecord } = await supabase
+    // Look up the template's header_type from the local catalog so
+    // sendTemplateMessage can decide whether to emit a header component —
+    // and so we can reject IMAGE-header templates that arrive without a
+    // header image BEFORE any recipient hits Meta. Prefer the row matching
+    // the broadcast language (the sync upserts by user+name+language);
+    // fall back to any row by name for legacy broadcasts that only name
+    // the template.
+    const headerLookup = supabase
       .from('message_templates')
       .select('header_type')
       .eq('user_id', user.id)
       .eq('name', template_name)
+
+    let templateRecord: { header_type: string | null } | null = null
+
+    const { data: langMatch } = await headerLookup
+      .eq('language', template_language ?? 'en_US')
       .maybeSingle()
 
-    const templateHeaderType = (templateRecord?.header_type as 'text' | 'image' | 'video' | 'document' | null) ?? null
+    if (langMatch) {
+      templateRecord = langMatch
+    } else {
+      const { data: nameMatch } = await headerLookup.maybeSingle()
+      templateRecord = nameMatch ?? null
+    }
+
+    const templateHeaderType =
+      (templateRecord?.header_type as MessageTemplateHeaderType | null) ?? null
+
+    if (
+      templateHeaderType === 'image' &&
+      !(header_image_url ?? '').trim()
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            'This template requires a header image. Please select an image before sending.',
+        },
+        { status: 400 },
+      )
+    }
 
     const { data: config, error: configError } = await supabase
       .from('whatsapp_config')

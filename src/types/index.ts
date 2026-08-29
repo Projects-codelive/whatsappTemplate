@@ -142,13 +142,16 @@ export interface WhatsAppConfig {
   connected_at?: string;
 }
 
+/** Meta template header formats surfaced from message_templates.header_type. */
+export type MessageTemplateHeaderType = 'text' | 'image' | 'video' | 'document';
+
 export interface MessageTemplate {
   id: string;
   user_id: string;
   name: string;
   category: 'Marketing' | 'Utility' | 'Authentication';
   language?: string;
-  header_type?: 'text' | 'image' | 'video' | 'document';
+  header_type?: MessageTemplateHeaderType;
   header_content?: string;
   body_text: string;
   footer_text?: string;

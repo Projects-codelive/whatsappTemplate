@@ -27,6 +27,7 @@ interface Step4Props {
   onNameChange: (name: string) => void;
   template: MessageTemplate;
   audience: AudienceConfig;
+  headerImageUrl?: string;
   onSend: () => void;
   onSaveDraft?: () => void;
   onBack: () => void;
@@ -39,6 +40,7 @@ export function Step4ScheduleSend({
   onNameChange,
   template,
   audience,
+  headerImageUrl,
   onSend,
   onSaveDraft,
   onBack,
@@ -48,6 +50,10 @@ export function Step4ScheduleSend({
   const [showConfirm, setShowConfirm] = useState(false);
   const [estimatedReach, setEstimatedReach] = useState<number>(0);
   const [loadingReach, setLoadingReach] = useState(true);
+
+  const requiresHeaderImage = template.header_type === 'image';
+  const headerImageMissing =
+    requiresHeaderImage && !(headerImageUrl ?? '').trim();
 
   useEffect(() => {
     async function calculateReach() {
@@ -140,6 +146,12 @@ export function Step4ScheduleSend({
             <p className="text-white">{template.language ?? 'en_US'}</p>
           </div>
         </div>
+        {headerImageMissing && (
+          <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+            This template has an image header. Add an image in the
+            Personalize step before sending.
+          </div>
+        )}
       </div>
 
       {/* Processing overlay */}
@@ -189,7 +201,7 @@ export function Step4ScheduleSend({
           <DialogTrigger
             render={
               <Button
-                disabled={!name.trim() || isProcessing}
+                disabled={!name.trim() || headerImageMissing || isProcessing}
                 className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               />
             }

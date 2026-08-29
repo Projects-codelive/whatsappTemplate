@@ -120,6 +120,9 @@ export function Step3Personalize({
     return extractPlaceholders(template.body_text);
   }, [template.body_text]);
 
+  const requiresHeaderImage = template.header_type === 'image';
+  const headerImageMissing = requiresHeaderImage && !headerImageUrl.trim();
+
   const unmappedKeys = useMemo(() => {
     const missing: string[] = [];
     for (const placeholder of placeholders) {
@@ -212,13 +215,23 @@ export function Step3Personalize({
         </p>
       </div>
 
-      {/* Header Image — optional, above placeholders */}
+      {/* Header Image — required for IMAGE-header templates, optional otherwise */}
       <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
         <div className="mb-3 flex items-center gap-2">
           <Image className="h-4 w-4 text-slate-400" />
           <p className="text-sm font-medium text-white">Header Image</p>
-          <span className="text-xs text-slate-500">(optional)</span>
+          {requiresHeaderImage ? (
+            <span className="text-xs text-amber-300">(required for this template)</span>
+          ) : (
+            <span className="text-xs text-slate-500">(optional)</span>
+          )}
         </div>
+
+        {requiresHeaderImage && headerImageMissing && (
+          <div className="mb-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+            This template has an image header. Select an image before continuing.
+          </div>
+        )}
 
         <div className="space-y-2">
           <label
@@ -452,14 +465,21 @@ export function Step3Personalize({
           <ArrowLeft className="h-4 w-4" />
           Back
         </Button>
-        <Button
-          onClick={onNext}
-          disabled={unmappedKeys.length > 0}
-          className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-        >
-          Next
-          <ArrowRight className="h-4 w-4" />
-        </Button>
+        <div className="flex items-center gap-3">
+          {headerImageMissing && (
+            <span className="max-w-[240px] text-right text-xs text-red-400">
+              This template requires a header image.
+            </span>
+          )}
+          <Button
+            onClick={onNext}
+            disabled={unmappedKeys.length > 0 || headerImageMissing}
+            className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            Next
+            <ArrowRight className="h-4 w-4" />
+          </Button>
+        </div>
       </div>
     </div>
   );

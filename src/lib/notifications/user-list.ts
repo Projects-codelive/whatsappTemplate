@@ -6,7 +6,7 @@ import type {
 import { expandNotificationCategory } from './categories'
 
 /** Page sizes offered by the users table pagination control. */
-export const PAGE_SIZE_OPTIONS = [25, 50, 100] as const
+export const PAGE_SIZE_OPTIONS = [25, 50, 100, 500, 1000] as const
 export type PageSize = (typeof PAGE_SIZE_OPTIONS)[number]
 export const DEFAULT_PAGE_SIZE: PageSize = 25
 
