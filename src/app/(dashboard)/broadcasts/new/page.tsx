@@ -53,6 +53,8 @@ export default function NewBroadcastPage() {
   >({});
   const [headerImageUrl, setHeaderImageUrl] = useState('');
   const [name, setName] = useState('');
+  const [sendingMode, setSendingMode] = useState<'now' | 'scheduled'>('now');
+  const [scheduledAt, setScheduledAt] = useState('');
 
   // Clone: apply search params once templates are loaded.
   const cloneApplied = useRef(false);
@@ -66,6 +68,9 @@ export default function NewBroadcastPage() {
 
     cloneApplied.current = true;
 
+    // Intentional one-shot hydration of the compose form from the
+    // ?name/&audience/&variables clone params (guarded by cloneApplied).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (cloneName) setName(cloneName);
     setAudience(
       safeParseJson<AudienceState>(searchParams.get('audience'), { type: 'all' }),
@@ -77,6 +82,7 @@ export default function NewBroadcastPage() {
 
   useEffect(() => {
     if (cloneApplied.current && template) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setCurrentStep(1);
     }
   }, [template]);
@@ -97,6 +103,10 @@ export default function NewBroadcastPage() {
         },
         variables,
         headerImageUrl: headerImageUrl || undefined,
+        scheduledAt:
+          sendingMode === 'scheduled' && scheduledAt
+            ? scheduledAt
+            : undefined,
       });
       router.push(`/broadcasts/${broadcastId}`);
     } catch (err) {
@@ -245,6 +255,10 @@ export default function NewBroadcastPage() {
               template={template}
               audience={audience}
               headerImageUrl={headerImageUrl}
+              sendingMode={sendingMode}
+              onSendingModeChange={setSendingMode}
+              scheduledAt={scheduledAt}
+              onScheduledAtChange={setScheduledAt}
               onSend={handleSend}
               onSaveDraft={handleSaveDraft}
               onBack={() => setCurrentStep(2)}

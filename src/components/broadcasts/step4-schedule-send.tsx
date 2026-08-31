@@ -14,7 +14,15 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog';
-import { ArrowLeft, Send, Loader2, Users, Save } from 'lucide-react';
+import {
+  ArrowLeft,
+  Send,
+  CalendarClock,
+  Loader2,
+  Users,
+  Save,
+  X,
+} from 'lucide-react';
 
 interface AudienceConfig {
   type: string;
@@ -28,11 +36,47 @@ interface Step4Props {
   template: MessageTemplate;
   audience: AudienceConfig;
   headerImageUrl?: string;
+  /** 'now' sends immediately; 'scheduled' hands off to the cron. */
+  sendingMode: 'now' | 'scheduled';
+  onSendingModeChange: (mode: 'now' | 'scheduled') => void;
+  /** ISO timestamp of the scheduled send, '' when unset. */
+  scheduledAt: string;
+  onScheduledAtChange: (iso: string) => void;
   onSend: () => void;
   onSaveDraft?: () => void;
   onBack: () => void;
   isProcessing: boolean;
   progress: number;
+}
+
+/**
+ * Validate a scheduled ISO timestamp for a send that has not yet
+ * happened. Returns a human error string, or null when OK.
+ */
+export function validateScheduledAt(iso: string): string | null {
+  if (!iso) return 'Pick a date and time to schedule the send.';
+  const ms = new Date(iso).getTime();
+  if (Number.isNaN(ms)) return 'That date and time is not valid.';
+  if (ms <= Date.now()) return 'Scheduled time must be in the future.';
+  return null;
+}
+
+/** ISO → local "YYYY-MM-DDTHH:mm" for <input type="datetime-local">. */
+export function toLocalInputValue(iso: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(
+    d.getHours(),
+  )}:${pad(d.getMinutes())}`;
+}
+
+/** Local "YYYY-MM-DDTHH:mm" → ISO timestamp (locale-aware Date parse). */
+export function fromLocalInputValue(value: string): string {
+  if (!value) return '';
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? '' : d.toISOString();
 }
 
 export function Step4ScheduleSend({
@@ -41,6 +85,10 @@ export function Step4ScheduleSend({
   template,
   audience,
   headerImageUrl,
+  sendingMode,
+  onSendingModeChange,
+  scheduledAt,
+  onScheduledAtChange,
   onSend,
   onSaveDraft,
   onBack,
@@ -54,6 +102,9 @@ export function Step4ScheduleSend({
   const requiresHeaderImage = template.header_type === 'image';
   const headerImageMissing =
     requiresHeaderImage && !(headerImageUrl ?? '').trim();
+
+  const scheduleError =
+    sendingMode === 'scheduled' ? validateScheduledAt(scheduledAt) : null;
 
   useEffect(() => {
     async function calculateReach() {
@@ -96,12 +147,24 @@ export function Step4ScheduleSend({
           ? 'CSV Upload'
           : 'Custom';
 
+  const canSend =
+    Boolean(name.trim()) &&
+    !headerImageMissing &&
+    !isProcessing &&
+    (sendingMode !== 'scheduled' || scheduleError === null);
+
+  const formattedScheduledAt =
+    sendingMode === 'scheduled' && scheduledAt
+      ? new Date(scheduledAt).toLocaleString()
+      : null;
+
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-lg font-semibold text-white">Review & Send</h2>
         <p className="mt-1 text-sm text-slate-400">
-          Name your broadcast, review the details, and send.
+          Name your broadcast, review the details, and send now or schedule
+          it for later.
         </p>
       </div>
 
@@ -114,6 +177,68 @@ export function Step4ScheduleSend({
           placeholder="e.g. Summer Sale Announcement"
           className="border-slate-700 bg-slate-800 text-white placeholder:text-slate-500"
         />
+      </div>
+
+      {/* Send now vs Schedule */}
+      <div>
+        <label className="mb-1.5 block text-sm font-medium text-white">
+          Delivery
+        </label>
+        <div className="inline-flex rounded-lg border border-slate-700 bg-slate-800 p-1">
+          <button
+            type="button"
+            onClick={() => onSendingModeChange('now')}
+            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              sendingMode === 'now'
+                ? 'bg-primary text-primary-foreground'
+                : 'text-slate-300 hover:text-white'
+            }`}
+          >
+            <Send className="h-3.5 w-3.5" />
+            Send Now
+          </button>
+          <button
+            type="button"
+            onClick={() => onSendingModeChange('scheduled')}
+            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              sendingMode === 'scheduled'
+                ? 'bg-primary text-primary-foreground'
+                : 'text-slate-300 hover:text-white'
+            }`}
+          >
+            <CalendarClock className="h-3.5 w-3.5" />
+            Schedule
+          </button>
+        </div>
+
+        {sendingMode === 'scheduled' && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Input
+              type="datetime-local"
+              value={toLocalInputValue(scheduledAt)}
+              onChange={(e) => onScheduledAtChange(fromLocalInputValue(e.target.value))}
+              className="w-auto border-slate-700 bg-slate-800 text-white [color-scheme:dark]"
+            />
+            {scheduledAt && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onScheduledAtChange('')}
+                className="border-slate-700 text-slate-300 hover:bg-slate-800"
+              >
+                <X className="h-3.5 w-3.5" />
+                Clear
+              </Button>
+            )}
+            <span className="text-xs text-slate-400">
+              The broadcast is sent by the server at this time — no browser
+              needs to stay open. You can cancel it any time before then.
+            </span>
+          </div>
+        )}
+        {sendingMode === 'scheduled' && scheduleError && (
+          <p className="mt-2 text-xs text-red-400">{scheduleError}</p>
+        )}
       </div>
 
       {/* Summary Card */}
@@ -142,8 +267,12 @@ export function Step4ScheduleSend({
             </div>
           </div>
           <div>
-            <p className="text-xs text-slate-400">Language</p>
-            <p className="text-white">{template.language ?? 'en_US'}</p>
+            <p className="text-xs text-slate-400">Delivery</p>
+            <p className="text-white">
+              {sendingMode === 'scheduled'
+                ? formattedScheduledAt ?? 'Scheduled'
+                : 'Immediately'}
+            </p>
           </div>
         </div>
         {headerImageMissing && (
@@ -160,7 +289,11 @@ export function Step4ScheduleSend({
           <div className="mb-2 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Loader2 className="h-4 w-4 animate-spin text-primary" />
-              <p className="text-sm font-medium text-white">Sending broadcast...</p>
+              <p className="text-sm font-medium text-white">
+                {sendingMode === 'scheduled'
+                  ? 'Scheduling broadcast...'
+                  : 'Sending broadcast...'}
+              </p>
             </div>
             <span className="text-xs font-medium text-primary">{progress}%</span>
           </div>
@@ -201,23 +334,51 @@ export function Step4ScheduleSend({
           <DialogTrigger
             render={
               <Button
-                disabled={!name.trim() || headerImageMissing || isProcessing}
+                disabled={!canSend}
                 className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               />
             }
           >
-            <Send className="h-4 w-4" />
-            Send Broadcast
+            {sendingMode === 'scheduled' ? (
+              <CalendarClock className="h-4 w-4" />
+            ) : (
+              <Send className="h-4 w-4" />
+            )}
+            {sendingMode === 'scheduled' ? 'Schedule Broadcast' : 'Send Broadcast'}
           </DialogTrigger>
           <DialogContent className="border-slate-700 bg-slate-900 sm:max-w-md">
             <DialogHeader>
-              <DialogTitle className="text-white">Confirm Broadcast</DialogTitle>
+              <DialogTitle className="text-white">
+                {sendingMode === 'scheduled'
+                  ? 'Schedule Broadcast'
+                  : 'Confirm Broadcast'}
+              </DialogTitle>
               <DialogDescription className="text-slate-400">
-                You are about to send this broadcast to{' '}
-                <span className="font-medium text-white">{estimatedReach.toLocaleString()}</span>{' '}
-                contacts using the{' '}
-                <span className="font-medium text-white">{template.name}</span> template.
-                This action cannot be undone.
+                {sendingMode === 'scheduled' ? (
+                  <>
+                    Schedule this broadcast to{' '}
+                    <span className="font-medium text-white">
+                      {formattedScheduledAt}
+                    </span>{' '}
+                    for{' '}
+                    <span className="font-medium text-white">
+                      {estimatedReach.toLocaleString()}
+                    </span>{' '}
+                    contacts using the{' '}
+                    <span className="font-medium text-white">
+                      {template.name}
+                    </span>{' '}
+                    template. You can cancel it before it sends.
+                  </>
+                ) : (
+                  <>
+                    You are about to send this broadcast to{' '}
+                    <span className="font-medium text-white">{estimatedReach.toLocaleString()}</span>{' '}
+                    contacts using the{' '}
+                    <span className="font-medium text-white">{template.name}</span> template.
+                    This action cannot be undone.
+                  </>
+                )}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -235,8 +396,12 @@ export function Step4ScheduleSend({
                 }}
                 className="bg-primary text-primary-foreground hover:bg-primary/90"
               >
-                <Send className="h-4 w-4" />
-                Confirm & Send
+                {sendingMode === 'scheduled' ? (
+                  <CalendarClock className="h-4 w-4" />
+                ) : (
+                  <Send className="h-4 w-4" />
+                )}
+                {sendingMode === 'scheduled' ? 'Confirm & Schedule' : 'Confirm & Send'}
               </Button>
             </DialogFooter>
           </DialogContent>

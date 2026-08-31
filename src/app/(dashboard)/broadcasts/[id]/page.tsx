@@ -20,6 +20,14 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import {
   ArrowLeft,
   Loader2,
   Users,
@@ -32,12 +40,17 @@ import {
   Download,
   ChevronDown,
   Trash2,
+  Pause,
+  Play,
+  RotateCcw,
+  XCircle,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   getBroadcastStatus,
   getRecipientStatus,
 } from '@/lib/broadcast-status';
+import { useBroadcastSending } from '@/hooks/use-broadcast-sending';
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -157,6 +170,11 @@ export default function BroadcastDetailPage() {
   );
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [resendOpen, setResendOpen] = useState(false);
+  const [actionLoading, setActionLoading] = useState(false);
+  const { sendPreparedBroadcast, isProcessing: isSendingPrepared } =
+    useBroadcastSending();
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const broadcastIdRef = useRef(broadcastId);
   broadcastIdRef.current = broadcastId;
@@ -194,10 +212,16 @@ export default function BroadcastDetailPage() {
     fetchData();
   }, [fetchData, broadcastId]);
 
-  const isSending = broadcast?.status === 'sending';
+  // Poll while the broadcast is still moving: scheduled broadcasts flip
+  // to `sending` server-side via the cron, so the detail view must keep
+  // listening until a terminal state (sent/failed/cancelled) lands.
+  const isActiveStatus =
+    broadcast?.status === 'scheduled' ||
+    broadcast?.status === 'sending' ||
+    broadcast?.status === 'paused';
 
   useEffect(() => {
-    if (!isSending) {
+    if (!isActiveStatus) {
       if (pollTimer.current) {
         clearInterval(pollTimer.current);
         pollTimer.current = null;
@@ -212,7 +236,7 @@ export default function BroadcastDetailPage() {
         pollTimer.current = null;
       }
     };
-  }, [isSending, fetchData]);
+  }, [isActiveStatus, fetchData]);
 
   const filteredRecipients = useMemo(
     () =>
@@ -269,6 +293,112 @@ export default function BroadcastDetailPage() {
     router.push('/broadcasts');
   }
 
+  /** Pause / resume / cancel — atomic server-side status claims. */
+  async function runAction(action: 'pause' | 'resume' | 'cancel') {
+    setActionLoading(true);
+    try {
+      const res = await fetch(`/api/whatsapp/broadcast/${broadcastId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Action failed');
+      if (action === 'cancel') setCancelOpen(false);
+      toast.success(
+        action === 'cancel'
+          ? 'Broadcast cancelled'
+          : action === 'pause'
+            ? 'Broadcast paused'
+            : 'Broadcast resumed',
+      );
+      await fetchData();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Action failed');
+    } finally {
+      setActionLoading(false);
+    }
+  }
+
+  /** Resume picks pending recipients back up. Cron-mode broadcasts are
+   *  dispatched by the server sweep; browser-mode ones by this tab. */
+  async function handleResume() {
+    setActionLoading(true);
+    try {
+      const res = await fetch(`/api/whatsapp/broadcast/${broadcastId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'resume' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Resume failed');
+      toast.success('Broadcast resumed');
+
+      if (broadcast?.dispatch_mode === 'cron') {
+        toast.info(
+          'The server continues sending on its next scheduled sweep.',
+        );
+        await fetchData();
+        return;
+      }
+
+      await sendPreparedBroadcast(broadcastId);
+      await fetchData();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Resume failed');
+    } finally {
+      setActionLoading(false);
+    }
+  }
+
+  /** Build a new broadcast for recipients who received but never
+   *  replied, then push it from this tab. Idempotent — a repeated click
+   *  resolves to the same resend. */
+  async function handleResend() {
+    setActionLoading(true);
+    try {
+      const res = await fetch(`/api/whatsapp/broadcast/${broadcastId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'resend' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Resend failed');
+      setResendOpen(false);
+
+      const newId = data.broadcast_id as string;
+      if (data.already) {
+        router.push(`/broadcasts/${newId}`);
+        return;
+      }
+
+      await sendPreparedBroadcast(newId);
+      toast.success(
+        `Broadcast re-sent to ${(data.recipient_count ?? 0).toLocaleString()} non-responder${data.recipient_count === 1 ? '' : 's'}`,
+      );
+      router.push(`/broadcasts/${newId}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Resend failed');
+    } finally {
+      setActionLoading(false);
+    }
+  }
+
+  /** Contacts who received the broadcast but never replied — the audit
+   *  set for "Resend to Non-Responders". */
+  const nonResponderCount = useMemo(
+    () =>
+      recipients.filter(
+        (r) =>
+          r.status === 'sent' ||
+          r.status === 'delivered' ||
+          r.status === 'read',
+      ).length,
+    [recipients],
+  );
+
+  const actionBusy = actionLoading || isSendingPrepared;
+
   if (loading) {
     return (
       <div className="flex h-64 items-center justify-center">
@@ -323,54 +453,193 @@ export default function BroadcastDetailPage() {
               <span>Template: {broadcast.template_name}</span>
               <span>-</span>
               <span>
-                Created {new Date(broadcast.created_at).toLocaleDateString()}
+                {broadcast.scheduled_at
+                  ? `Scheduled ${new Date(broadcast.scheduled_at).toLocaleString()}`
+                  : `Created ${new Date(broadcast.created_at).toLocaleDateString()}`}
               </span>
             </div>
           </div>
         </div>
 
-        {/* Delete — inline-confirm pattern matches the pipeline-settings
-            "Delete Pipeline" flow. Mid-send broadcasts can't be deleted
-            because orphaning in-flight Meta messages would leave the
-            funnel inconsistent. */}
-        {confirmDelete ? (
-          <div className="flex items-center gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm">
-            <span className="text-red-300">Delete this broadcast?</span>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Contextual broadcast actions */}
+          {broadcast.status === 'sending' && (
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setConfirmDelete(false)}
-              disabled={deleting}
-              className="h-7 border-slate-700 bg-transparent text-slate-300 hover:bg-slate-800"
+              onClick={() => runAction('pause')}
+              disabled={actionBusy}
+              className="border-slate-700 text-slate-300 hover:bg-slate-800"
             >
+              <Pause className="h-3.5 w-3.5" />
+              Pause
+            </Button>
+          )}
+
+          {broadcast.status === 'paused' && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleResume}
+              disabled={actionBusy}
+              className="border-slate-700 text-slate-300 hover:bg-slate-800"
+            >
+              <Play className="h-3.5 w-3.5" />
+              Resume
+            </Button>
+          )}
+
+          {(broadcast.status === 'scheduled' ||
+            broadcast.status === 'sending' ||
+            broadcast.status === 'paused') && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setCancelOpen(true)}
+              disabled={actionBusy}
+              className="border-red-500/30 bg-transparent text-red-400 hover:bg-red-500/10"
+            >
+              <XCircle className="h-3.5 w-3.5" />
               Cancel
             </Button>
+          )}
+
+          {(broadcast.status === 'sent' ||
+            broadcast.status === 'failed' ||
+            broadcast.status === 'cancelled') &&
+            nonResponderCount > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setResendOpen(true)}
+                disabled={actionBusy}
+                className="border-primary/30 bg-transparent text-primary hover:bg-primary/10"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                Resend to Non-Responders
+              </Button>
+            )}
+
+        {/* Delete — inline-confirm pattern matches the pipeline-settings
+              "Delete Pipeline" flow. Mid-send broadcasts can't be deleted
+              because orphaning in-flight Meta messages would leave the
+              funnel inconsistent. */}
+          {confirmDelete ? (
+            <div className="flex items-center gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm">
+              <span className="text-red-300">Delete this broadcast?</span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setConfirmDelete(false)}
+                disabled={deleting}
+                className="h-7 border-slate-700 bg-transparent text-slate-300 hover:bg-slate-800"
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                onClick={handleDelete}
+                disabled={deleting}
+                className="h-7 bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+              >
+                {deleting ? 'Deleting…' : 'Confirm'}
+              </Button>
+            </div>
+          ) : (
             <Button
+              variant="outline"
               size="sm"
-              onClick={handleDelete}
-              disabled={deleting}
-              className="h-7 bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+              disabled={broadcast.status === 'sending'}
+              onClick={() => setConfirmDelete(true)}
+              title={
+                broadcast.status === 'sending'
+                  ? 'Cannot delete while a broadcast is actively sending'
+                  : 'Delete this broadcast'
+              }
+              className="border-red-500/30 bg-transparent text-red-400 hover:bg-red-500/10 disabled:opacity-40"
             >
-              {deleting ? 'Deleting…' : 'Confirm'}
+              <Trash2 className="h-3.5 w-3.5" />
+              Delete
             </Button>
-          </div>
-        ) : (
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={broadcast.status === 'sending'}
-            onClick={() => setConfirmDelete(true)}
-            title={
-              broadcast.status === 'sending'
-                ? 'Cannot delete while a broadcast is actively sending'
-                : 'Delete this broadcast'
-            }
-            className="border-red-500/30 bg-transparent text-red-400 hover:bg-red-500/10 disabled:opacity-40"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-            Delete
-          </Button>
-        )}
+          )}
+        </div>
+
+        {/* Cancel confirmation */}
+        <Dialog open={cancelOpen} onOpenChange={setCancelOpen}>
+          <DialogContent className="border-slate-700 bg-slate-900 text-slate-200 sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle className="text-white">Cancel Broadcast</DialogTitle>
+              <DialogDescription className="text-slate-400">
+                Stop this broadcast now. Recipients already sent keep their
+                status; unsent recipients stay unsent. This cannot be undone.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setCancelOpen(false)}
+                disabled={actionLoading}
+                className="border-slate-700 text-slate-300 hover:bg-slate-800"
+              >
+                Keep going
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => runAction('cancel')}
+                disabled={actionLoading}
+              >
+                {actionLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Cancel broadcast
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Resend to Non-Responders confirmation */}
+        <Dialog open={resendOpen} onOpenChange={setResendOpen}>
+          <DialogContent className="border-slate-700 bg-slate-900 text-slate-200 sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle className="text-white">
+                Resend to Non-Responders
+              </DialogTitle>
+              <DialogDescription className="text-slate-400">
+                Send this template again to the{' '}
+                <span className="font-medium text-white">
+                  {nonResponderCount.toLocaleString()}
+                </span>{' '}
+                contacts who received it but never replied. Responders and
+                never-received or failed contacts are excluded. This creates
+                a new broadcast.
+                {broadcast.status === 'failed' && (
+                  <>
+                    {' '}
+                    Note: every recipient failed, so only contacts already
+                    marked sent/delivered/read are included.
+                  </>
+                )}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setResendOpen(false)}
+                disabled={actionBusy}
+                className="border-slate-700 text-slate-300 hover:bg-slate-800"
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleResend}
+                disabled={actionBusy}
+                className="bg-primary text-primary-foreground hover:bg-primary/90"
+              >
+                {actionBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                <RotateCcw className="mr-2 h-4 w-4" />
+                Resend
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
 
       {/* Stats — 6 cards: Total / Sent / Delivered / Read / Replied / Failed */}

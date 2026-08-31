@@ -40,10 +40,23 @@ import {
   Trash2,
   Filter,
   ChevronDown,
+  Pause,
+  Play,
+  RotateCcw,
+  XCircle,
 } from 'lucide-react';
 import { getBroadcastStatus, broadcastStatusConfig } from '@/lib/broadcast-status';
+import { useBroadcastSending } from '@/hooks/use-broadcast-sending';
 
-const BROADCAST_STATUSES: BroadcastStatus[] = ['draft', 'scheduled', 'sending', 'sent', 'failed'];
+const BROADCAST_STATUSES: BroadcastStatus[] = [
+  'draft',
+  'scheduled',
+  'sending',
+  'sent',
+  'failed',
+  'paused',
+  'cancelled',
+];
 
 /**
  * Poll cadence while any broadcast is sending. Kept modest so we don't
@@ -102,6 +115,13 @@ export default function BroadcastsPage() {
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  // Row-level status transitions (pause/resume/cancel/resend)
+  const [rowActionId, setRowActionId] = useState<string | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<Broadcast | null>(null);
+  const [resendTarget, setResendTarget] = useState<Broadcast | null>(null);
+  const [resending, setResending] = useState(false);
+  const { sendPreparedBroadcast } = useBroadcastSending();
+
   // Clear selection when search or filter changes
   const prevSearchRef = useRef(search);
   const prevStatusRef = useRef(statusFilter);
@@ -153,6 +173,21 @@ export default function BroadcastsPage() {
 
   const anySending = useMemo(
     () => broadcasts.some((b) => b.status === 'sending'),
+    [broadcasts],
+  );
+
+  // Poll while anything is still moving: a scheduled broadcast flips to
+  // `sending` server-side via the cron, and `paused` may be resumed from
+  // the detail view — the list should stay fresh until everything lands
+  // in a terminal state.
+  const anyActive = useMemo(
+    () =>
+      broadcasts.some(
+        (b) =>
+          b.status === 'scheduled' ||
+          b.status === 'sending' ||
+          b.status === 'paused',
+      ),
     [broadcasts],
   );
 
@@ -219,6 +254,86 @@ export default function BroadcastsPage() {
     fetchBroadcasts();
   }
 
+  /** Pause / cancel — atomic server-side status claims. Resume from the
+   *  list uses the same endpoint (server sends for cron-mode; the browser
+   *  tab re-picks up pending recipients for browser-mode). */
+  async function runRowAction(
+    id: string,
+    action: 'pause' | 'resume',
+  ) {
+    setRowActionId(id);
+    try {
+      const res = await fetch(`/api/whatsapp/broadcast/${id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Action failed');
+      toast.success(
+        action === 'pause' ? 'Broadcast paused' : 'Broadcast resumed',
+      );
+      if (action === 'resume') await sendPreparedBroadcast(id);
+      fetchBroadcasts();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Action failed');
+    } finally {
+      setRowActionId(null);
+    }
+  }
+
+  async function confirmRowCancel() {
+    if (!cancelTarget) return;
+    const id = cancelTarget.id;
+    setRowActionId(id);
+    try {
+      const res = await fetch(`/api/whatsapp/broadcast/${id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'cancel' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Cancel failed');
+      toast.success('Broadcast cancelled');
+      setCancelTarget(null);
+      fetchBroadcasts();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Cancel failed');
+    } finally {
+      setRowActionId(null);
+    }
+  }
+
+  async function confirmRowResend() {
+    if (!resendTarget) return;
+    const id = resendTarget.id;
+    setResending(true);
+    try {
+      const res = await fetch(`/api/whatsapp/broadcast/${id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'resend' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Resend failed');
+      const newId = data.broadcast_id as string;
+      setResendTarget(null);
+      if (data.already) {
+        router.push(`/broadcasts/${newId}`);
+        return;
+      }
+      await sendPreparedBroadcast(newId);
+      toast.success(
+        `Broadcast re-sent to ${(data.recipient_count ?? 0).toLocaleString()} non-responder${data.recipient_count === 1 ? '' : 's'}`,
+      );
+      router.push(`/broadcasts/${newId}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Resend failed');
+    } finally {
+      setResending(false);
+    }
+  }
+
   async function handleBulkDelete() {
     setBulkDeleting(true);
     const supabase = createClient();
@@ -268,7 +383,7 @@ export default function BroadcastsPage() {
     // the user is away, and ensures a fresh fetch the moment they
     // refocus so they don't see stale data on return.
     function handleVisibilityChange() {
-      if (!anySending) return;
+      if (!anyActive) return;
       if (document.visibilityState === 'hidden') {
         stopPolling();
       } else {
@@ -277,7 +392,7 @@ export default function BroadcastsPage() {
       }
     }
 
-    if (anySending && document.visibilityState === 'visible') {
+    if (anyActive && document.visibilityState === 'visible') {
       startPolling();
     } else {
       stopPolling();
@@ -287,7 +402,7 @@ export default function BroadcastsPage() {
       stopPolling();
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [anySending]);
+  }, [anyActive]);
 
   if (loading) {
     return (
@@ -529,7 +644,9 @@ export default function BroadcastsPage() {
                       </span>
                     </TableCell>
                     <TableCell className="hidden text-slate-400 sm:table-cell">
-                      {new Date(broadcast.created_at).toLocaleDateString()}
+                      {broadcast.scheduled_at
+                        ? `Scheduled ${new Date(broadcast.scheduled_at).toLocaleString()}`
+                        : new Date(broadcast.created_at).toLocaleDateString()}
                     </TableCell>
                     <TableCell onClick={(e) => e.stopPropagation()}>
                       {deleteConfirm ? (
@@ -576,6 +693,58 @@ export default function BroadcastsPage() {
                               <Copy className="h-4 w-4" />
                               Clone
                             </DropdownMenuItem>
+
+                            {broadcast.status === 'sending' && (
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  runRowAction(broadcast.id, 'pause')
+                                }
+                                disabled={rowActionId === broadcast.id}
+                                className="text-slate-300 focus:bg-slate-800 focus:text-white"
+                              >
+                                <Pause className="h-4 w-4" />
+                                Pause
+                              </DropdownMenuItem>
+                            )}
+
+                            {broadcast.status === 'paused' && (
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  runRowAction(broadcast.id, 'resume')
+                                }
+                                disabled={rowActionId === broadcast.id}
+                                className="text-slate-300 focus:bg-slate-800 focus:text-white"
+                              >
+                                <Play className="h-4 w-4" />
+                                Resume
+                              </DropdownMenuItem>
+                            )}
+
+                            {(broadcast.status === 'scheduled' ||
+                              broadcast.status === 'sending' ||
+                              broadcast.status === 'paused') && (
+                              <DropdownMenuItem
+                                variant="destructive"
+                                onClick={() => setCancelTarget(broadcast)}
+                                disabled={rowActionId === broadcast.id}
+                              >
+                                <XCircle className="h-4 w-4" />
+                                Cancel
+                              </DropdownMenuItem>
+                            )}
+
+                            {(broadcast.status === 'sent' ||
+                              broadcast.status === 'failed' ||
+                              broadcast.status === 'cancelled') && (
+                              <DropdownMenuItem
+                                onClick={() => setResendTarget(broadcast)}
+                                disabled={rowActionId === broadcast.id}
+                                className="text-slate-300 focus:bg-slate-800 focus:text-white"
+                              >
+                                <RotateCcw className="h-4 w-4" />
+                                Resend to Non-Responders
+                              </DropdownMenuItem>
+                            )}
                             <DropdownMenuSeparator className="bg-slate-700" />
                             <DropdownMenuItem
                               variant="destructive"
@@ -636,6 +805,80 @@ export default function BroadcastsPage() {
               {bulkDeleting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               Delete {selectedIds.size - sendingBroadcastCount} broadcast
               {selectedIds.size - sendingBroadcastCount === 1 ? '' : 's'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Row cancel confirmation */}
+      <Dialog open={!!cancelTarget} onOpenChange={(o) => !o && setCancelTarget(null)}>
+        <DialogContent className="border-slate-700 bg-slate-900 text-slate-200 sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="text-white">Cancel Broadcast</DialogTitle>
+            <DialogDescription className="text-slate-400">
+              Stop{' '}
+              <span className="font-medium text-white">{cancelTarget?.name}</span>{' '}
+              now? Recipients already sent keep their status; unsent recipients
+              stay unsent. This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setCancelTarget(null)}
+              disabled={rowActionId === cancelTarget?.id}
+              className="border-slate-700 text-slate-300 hover:bg-slate-800"
+            >
+              Keep going
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={confirmRowCancel}
+              disabled={rowActionId === cancelTarget?.id}
+            >
+              {rowActionId === cancelTarget?.id && (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              Cancel broadcast
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Row resend confirmation */}
+      <Dialog open={!!resendTarget} onOpenChange={(o) => !o && setResendTarget(null)}>
+        <DialogContent className="border-slate-700 bg-slate-900 text-slate-200 sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-white">
+              Resend to Non-Responders
+            </DialogTitle>
+            <DialogDescription className="text-slate-400">
+              Send{' '}
+              <span className="font-medium text-white">
+                {resendTarget?.template_name}
+              </span>{' '}
+              again to the contacts who received it but never replied.
+              Responders and never-received or failed contacts are excluded.
+              This creates a new broadcast.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setResendTarget(null)}
+              disabled={resending}
+              className="border-slate-700 text-slate-300 hover:bg-slate-800"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={confirmRowResend}
+              disabled={resending}
+              className="bg-primary text-primary-foreground hover:bg-primary/90"
+            >
+              {resending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              <RotateCcw className="mr-2 h-4 w-4" />
+              Resend
             </Button>
           </DialogFooter>
         </DialogContent>

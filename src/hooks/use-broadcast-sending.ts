@@ -4,9 +4,13 @@ import { useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { Contact, MessageTemplate } from '@/types';
 import {
-  orderVariableKeys,
-  type TemplateVariableValue,
-} from '@/lib/whatsapp/template-variables';
+  resolveVariables,
+  type VariableMapping,
+} from '@/lib/broadcasts/resolve-variables';
+
+export { resolveVariables };
+export type { VariableMapping };
+export type { CustomValueIndex } from '@/lib/broadcasts/resolve-variables';
 
 export type CustomFieldOperator = 'is' | 'is_not' | 'contains';
 
@@ -33,10 +37,6 @@ export interface AudienceConfig {
  * contact_custom_values.value row keyed by the custom_fields.id stored
  * in `value`.
  */
-export type VariableMapping =
-  | { type: 'static'; value: string }
-  | { type: 'field'; value: string }
-  | { type: 'custom_field'; value: string };
 
 interface BroadcastPayload {
   name: string;
@@ -44,10 +44,21 @@ interface BroadcastPayload {
   audience: AudienceConfig;
   variables: Record<string, VariableMapping>;
   headerImageUrl?: string;
+  /**
+   * ISO timestamp. When set the broadcast is created as `scheduled`
+   * (dispatch_mode 'cron') and the composer does NOT start sending —
+   * the scheduled-send cron sweeps it when due.
+   */
+  scheduledAt?: string;
 }
 
 interface UseBroadcastSendingReturn {
+  /** Create a broadcast (from audience resolution) and immediately send
+   *  it, or — when `payload.scheduledAt` is set — leave it to the cron. */
   createAndSendBroadcast: (payload: BroadcastPayload) => Promise<string>;
+  /** Send an EXISTING broadcast's remaining pending recipients from the
+   *  browser (resume-clicks, resend targets). Requires status 'sending'. */
+  sendPreparedBroadcast: (broadcastId: string) => Promise<string>;
   isProcessing: boolean;
   progress: number;
 }
@@ -126,50 +137,6 @@ interface BroadcastApiResult {
   error?: string;
 }
 
-/** contactId → (customFieldId → value). */
-type CustomValueIndex = Map<string, Map<string, string>>;
-
-/**
- * Per-contact resolution of template placeholders. Static and
- * built-in-field mappings resolve synchronously; custom fields read
- * from a pre-built index to avoid N+1 queries during the send loop.
- *
- * The returned array is ordered — values[i] fills the i-th
- * {{placeholder}} in the template body — so `body` orders the keys
- * (body order for both named and numeric placeholders, not
- * alphabetical). Each value carries its placeholder `key`, which the
- * Meta parameter builder uses to emit `parameter_name` for named
- * placeholders. Without `body` the keys fall back to numeric-aware
- * order to preserve legacy behaviour.
- */
-export function resolveVariables(
-  variables: Record<string, VariableMapping>,
-  contact: Contact,
-  customValues?: Map<string, string>,
-  body?: string,
-): TemplateVariableValue[] {
-  const keys = orderVariableKeys(variables, body);
-
-  return keys.map((key) => {
-    const v = variables[key];
-
-    if (v.type === 'static') return { key, value: v.value };
-
-    if (v.type === 'field') {
-      const fieldMap: Record<string, string | undefined> = {
-        name: contact.name,
-        phone: contact.phone,
-        email: contact.email,
-        company: contact.company,
-      };
-      return { key, value: fieldMap[v.value] ?? '' };
-    }
-
-    // custom_field
-    return { key, value: customValues?.get(v.value) ?? '' };
-  });
-}
-
 /**
  * Bulk-fetch contact_custom_values for a set of contacts. Returns an
  * index keyed by contact_id → field_id → value.
@@ -177,8 +144,8 @@ export function resolveVariables(
 async function fetchCustomValueIndex(
   supabase: ReturnType<typeof createClient>,
   contactIds: string[],
-): Promise<CustomValueIndex> {
-  const index: CustomValueIndex = new Map();
+) {
+  const index = new Map<string, Map<string, string>>();
   if (contactIds.length === 0) return index;
 
   // Supabase PostgREST caps the .in(...) IN-clause roughly at 1000
@@ -358,6 +325,233 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     return data ?? [];
   }
 
+  /**
+   * Reconstruct the MessageTemplate for a broadcast from the local
+   * catalog (name + language), falling back to any row by name. Needed
+   * for `body_text` placeholder ordering when sending a prepared
+   * broadcast (resume / resend) that wasn't created by this session.
+   */
+  async function fetchTemplateForBroadcast(
+    supabase: ReturnType<typeof createClient>,
+    broadcast: { user_id: string; template_name: string; template_language: string },
+  ): Promise<MessageTemplate> {
+    const base = supabase
+      .from('message_templates')
+      .select('*')
+      .eq('user_id', broadcast.user_id)
+      .eq('name', broadcast.template_name);
+
+    const { data: langMatch, error } = await base
+      .eq('language', broadcast.template_language ?? 'en_US')
+      .maybeSingle();
+
+    if (error) throw new Error(`Failed to load template: ${error.message}`);
+    if (langMatch) return langMatch as MessageTemplate;
+
+    const { data: nameMatch } = await base.maybeSingle();
+    if (!nameMatch) {
+      throw new Error(
+        `Template "${broadcast.template_name}" is no longer available`,
+      );
+    }
+    return nameMatch as MessageTemplate;
+  }
+
+  interface SendLoopContext {
+    broadcastId: string;
+    template: MessageTemplate;
+    variables: Record<string, VariableMapping>;
+    headerImageUrl?: string;
+  }
+
+  /**
+   * Shared send loop for a broadcast whose recipient rows already
+   * exist. Phase 3 behaviors:
+   *   - Only `pending` recipients are sent, so a resumed broadcast
+   *     never re-sends already-delivered contacts.
+   *   - Before every batch the broadcast's status is re-read; any value
+   *     other than `sending` (pause/cancel raced from another tab, or a
+   *     409/404 from the dispatch API) stops the loop mid-flight
+   *     WITHOUT marking the un-sent recipients failed — they stay
+   *     `pending` so a resume can continue them.
+   *   - Finalize claims `sending → sent|failed` only when the loop
+   *     actually finished; a stopped loop leaves the broadcast exactly
+   *     as the action endpoint set it.
+   */
+  async function runSendLoop(
+    context: SendLoopContext,
+    supabase: ReturnType<typeof createClient>,
+    setProgressFn: (value: number) => void,
+  ): Promise<void> {
+    const { broadcastId, template, variables, headerImageUrl } = context;
+
+    const { data: recipients, error: recipientsFetchError } = await supabase
+      .from('broadcast_recipients')
+      .select('*, contact:contacts(*)')
+      .eq('broadcast_id', broadcastId)
+      .eq('status', 'pending');
+
+    if (recipientsFetchError || !recipients) {
+      throw new Error('Failed to fetch broadcast recipients');
+    }
+
+    const contactIds = recipients
+      .map((r) => r.contact?.id)
+      .filter((id): id is string => Boolean(id));
+    const customValueIndex = await fetchCustomValueIndex(supabase, contactIds);
+
+    let failedCount = 0;
+    let stoppedEarly = false;
+    const totalRecipients = recipients.length;
+
+    for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
+      // ── Pre-batch status guard ────────────────────────────────
+      const { data: statusRow } = await supabase
+        .from('broadcasts')
+        .select('status')
+        .eq('id', broadcastId)
+        .single();
+      if (!statusRow || statusRow.status !== 'sending') {
+        stoppedEarly = true;
+        break;
+      }
+
+      const batch = recipients.slice(i, i + SEND_BATCH_SIZE);
+
+      const apiRecipients = batch
+        .filter((r) => r.contact?.phone)
+        .map((r) => ({
+          phone: r.contact!.phone as string,
+          params: r.contact
+            ? resolveVariables(
+                variables,
+                r.contact,
+                customValueIndex.get(r.contact.id),
+                template.body_text,
+              )
+            : [],
+        }));
+
+      if (apiRecipients.length === 0) continue;
+
+      try {
+        const res = await fetch('/api/whatsapp/broadcast', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            broadcast_id: broadcastId,
+            recipients: apiRecipients,
+            template_name: template.name,
+            template_language: template.language ?? 'en_US',
+            header_image_url: headerImageUrl || undefined,
+          }),
+        });
+
+        // Paused/cancelled/deleted between our status read and the API —
+        // stop cleanly, leave the batch pending.
+        if (res.status === 409 || res.status === 404) {
+          stoppedEarly = true;
+          break;
+        }
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.error || 'Broadcast API request failed');
+        }
+
+        const resultsByPhone = new Map<string, BroadcastApiResult>();
+        for (const r of (data.results ?? []) as BroadcastApiResult[]) {
+          resultsByPhone.set(r.phone, r);
+        }
+
+        for (const recipient of batch) {
+          const phone = recipient.contact?.phone;
+          const result = phone ? resultsByPhone.get(phone) : undefined;
+
+          if (!result) {
+            failedCount++;
+            await supabase
+              .from('broadcast_recipients')
+              .update({
+                status: 'failed',
+                error_message: 'No phone number on contact',
+              })
+              .eq('id', recipient.id);
+            continue;
+          }
+
+          if (result.status === 'sent') {
+            const persistResult = await persistRecipientUpdate(
+              supabase,
+              recipient.id,
+              {
+                status: 'sent',
+                sent_at: new Date().toISOString(),
+                whatsapp_message_id: result.whatsapp_message_id ?? null,
+                error_message: null,
+              },
+            );
+
+            if (!persistResult.success) {
+              failedCount++;
+              await supabase
+                .from('broadcast_recipients')
+                .update({
+                  status: 'failed',
+                  error_message: `Failed to record send: ${persistResult.errorMessage}`,
+                })
+                .eq('id', recipient.id);
+            }
+          } else {
+            failedCount++;
+            await supabase
+              .from('broadcast_recipients')
+              .update({
+                status: 'failed',
+                error_message: result.error ?? 'Unknown error',
+              })
+              .eq('id', recipient.id);
+          }
+        }
+      } catch (err) {
+        for (const recipient of batch) {
+          failedCount++;
+          await supabase
+            .from('broadcast_recipients')
+            .update({
+              status: 'failed',
+              error_message: err instanceof Error ? err.message : 'Unknown error',
+            })
+            .eq('id', recipient.id);
+        }
+      }
+
+      const progressPct =
+        30 + Math.round(((i + batch.length) / totalRecipients) * 60);
+      setProgressFn(Math.min(99, progressPct));
+
+      if (i + SEND_BATCH_SIZE < recipients.length) {
+        await sleep(SEND_BATCH_DELAY_MS);
+      }
+    }
+
+    // Only finalize when the loop actually drained every pending
+    // recipient. The `WHERE status = 'sending'` claim keeps a pause /
+    // cancel that landed after the last batch from being overwritten.
+    if (!stoppedEarly) {
+      const finalStatus =
+        totalRecipients > 0 && failedCount === totalRecipients
+          ? 'failed'
+          : 'sent';
+      await supabase
+        .from('broadcasts')
+        .update({ status: finalStatus })
+        .eq('id', broadcastId)
+        .eq('status', 'sending');
+    }
+  }
+
   async function createAndSendBroadcast(payload: BroadcastPayload): Promise<string> {
     setIsProcessing(true);
     setProgress(0);
@@ -374,6 +568,17 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         throw new Error('You are not signed in.');
       }
 
+      const isScheduled = Boolean(payload.scheduledAt);
+      if (isScheduled) {
+        const scheduledMs = new Date(payload.scheduledAt as string).getTime();
+        if (Number.isNaN(scheduledMs)) {
+          throw new Error('Please pick a valid send time.');
+        }
+        if (scheduledMs <= Date.now()) {
+          throw new Error('Scheduled time must be in the future.');
+        }
+      }
+
       // ── Step 1: Resolve audience contacts ─────────────────────────
       setProgress(5);
       const contacts = await resolveAudience(payload.audience);
@@ -383,6 +588,10 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       }
 
       // ── Step 2: Create broadcast row ──────────────────────────────
+      // Scheduled builds get status 'scheduled' + dispatch_mode 'cron'
+      // (the cron sweeps them). Everything else is 'sending'/'browser'
+      // and gets pushed here. The recipients are inserted now so the
+      // audience snapshot is fixed and the cron never re-resolves it.
       setProgress(10);
       const { data: broadcast, error: broadcastError } = await supabase
         .from('broadcasts')
@@ -398,7 +607,12 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
             customField: payload.audience.customField,
             excludeTagIds: payload.audience.excludeTagIds,
           },
-          status: 'sending',
+          header_image_url: payload.headerImageUrl ?? null,
+          dispatch_mode: isScheduled ? 'cron' : 'browser',
+          status: isScheduled ? 'scheduled' : 'sending',
+          scheduled_at: isScheduled
+            ? new Date(payload.scheduledAt as string).toISOString()
+            : null,
           total_recipients: contacts.length,
           sent_count: 0,
           delivered_count: 0,
@@ -442,145 +656,23 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         }
       }
 
-      // ── Step 4: Fetch recipients (joined contact) + preload custom values
-      setProgress(30);
-      const { data: recipients, error: recipientsFetchError } = await supabase
-        .from('broadcast_recipients')
-        .select('*, contact:contacts(*)')
-        .eq('broadcast_id', broadcast.id);
-
-      if (recipientsFetchError || !recipients) {
-        throw new Error('Failed to fetch broadcast recipients');
+      // Scheduled broadcasts hand off to the cron — the composer stops here.
+      if (isScheduled) {
+        setProgress(100);
+        return broadcast.id;
       }
 
-      const contactIds = recipients
-        .map((r) => r.contact?.id)
-        .filter((id): id is string => Boolean(id));
-      const customValueIndex = await fetchCustomValueIndex(supabase, contactIds);
-
-      let failedCount = 0;
-      const totalRecipients = recipients.length;
-
-      for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
-        const batch = recipients.slice(i, i + SEND_BATCH_SIZE);
-
-        const apiRecipients = batch
-          .filter((r) => r.contact?.phone)
-          .map((r) => ({
-            phone: r.contact!.phone as string,
-            params: r.contact
-              ? resolveVariables(
-                  payload.variables,
-                  r.contact,
-                  customValueIndex.get(r.contact.id),
-                  payload.template.body_text,
-                )
-              : [],
-          }));
-
-        if (apiRecipients.length === 0) continue;
-
-        try {
-          const res = await fetch('/api/whatsapp/broadcast', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              recipients: apiRecipients,
-              template_name: payload.template.name,
-              template_language: payload.template.language ?? 'en_US',
-              header_image_url: payload.headerImageUrl,
-            }),
-          });
-
-          const data = await res.json();
-
-          if (!res.ok) {
-            throw new Error(data.error || 'Broadcast API request failed');
-          }
-
-          const resultsByPhone = new Map<string, BroadcastApiResult>();
-          for (const r of (data.results ?? []) as BroadcastApiResult[]) {
-            resultsByPhone.set(r.phone, r);
-          }
-
-          for (const recipient of batch) {
-            const phone = recipient.contact?.phone;
-            const result = phone ? resultsByPhone.get(phone) : undefined;
-
-            if (!result) {
-              failedCount++;
-              await supabase
-                .from('broadcast_recipients')
-                .update({
-                  status: 'failed',
-                  error_message: 'No phone number on contact',
-                })
-                .eq('id', recipient.id);
-              continue;
-            }
-
-            if (result.status === 'sent') {
-              const persistResult = await persistRecipientUpdate(
-                supabase,
-                recipient.id,
-                {
-                  status: 'sent',
-                  sent_at: new Date().toISOString(),
-                  whatsapp_message_id: result.whatsapp_message_id ?? null,
-                  error_message: null,
-                },
-              );
-
-              if (!persistResult.success) {
-                failedCount++;
-                await supabase
-                  .from('broadcast_recipients')
-                  .update({
-                    status: 'failed',
-                    error_message: `Failed to record send: ${persistResult.errorMessage}`,
-                  })
-                  .eq('id', recipient.id);
-              }
-            } else {
-              failedCount++;
-              await supabase
-                .from('broadcast_recipients')
-                .update({
-                  status: 'failed',
-                  error_message: result.error ?? 'Unknown error',
-                })
-                .eq('id', recipient.id);
-            }
-          }
-        } catch (err) {
-          for (const recipient of batch) {
-            failedCount++;
-            await supabase
-              .from('broadcast_recipients')
-              .update({
-                status: 'failed',
-                error_message: err instanceof Error ? err.message : 'Unknown error',
-              })
-              .eq('id', recipient.id);
-          }
-        }
-
-        const progressPct =
-          30 + Math.round(((i + batch.length) / totalRecipients) * 60);
-        setProgress(progressPct);
-
-        if (i + SEND_BATCH_SIZE < recipients.length) {
-          await sleep(SEND_BATCH_DELAY_MS);
-        }
-      }
-
-      // ── Step 5: Finalize status ───────────────────────────────────
-      setProgress(95);
-      const finalStatus = failedCount === totalRecipients ? 'failed' : 'sent';
-      await supabase
-        .from('broadcasts')
-        .update({ status: finalStatus })
-        .eq('id', broadcast.id);
+      // ── Step 4+: run the shared send loop ─────────────────────────
+      await runSendLoop(
+        {
+          broadcastId: broadcast.id,
+          template: payload.template,
+          variables: payload.variables,
+          headerImageUrl: payload.headerImageUrl,
+        },
+        supabase,
+        setProgress,
+      );
 
       setProgress(100);
       return broadcast.id;
@@ -589,5 +681,61 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     }
   }
 
-  return { createAndSendBroadcast, isProcessing, progress };
+  async function sendPreparedBroadcast(broadcastId: string): Promise<string> {
+    setIsProcessing(true);
+    setProgress(0);
+
+    const supabase = createClient();
+
+    try {
+      const { data: broadcast, error: bcErr } = await supabase
+        .from('broadcasts')
+        .select('*')
+        .eq('id', broadcastId)
+        .single();
+
+      if (bcErr || !broadcast) {
+        throw new Error(
+          bcErr?.message ?? 'Broadcast not found — it may have been deleted.',
+        );
+      }
+
+      // Scheduled/cron broadcasts are exclusively server-dispatched; the
+      // browser must not double-send against the sweep.
+      if (broadcast.dispatch_mode === 'cron') {
+        throw new Error(
+          'This broadcast is dispatched by the scheduled sender on the server.',
+        );
+      }
+
+      if (broadcast.status !== 'sending') {
+        throw new Error(
+          `Broadcast is ${broadcast.status} — resume it before sending.`,
+        );
+      }
+
+      const template = await fetchTemplateForBroadcast(supabase, broadcast);
+      const variables = (broadcast.template_variables ??
+        {}) as Record<string, VariableMapping>;
+
+      setProgress(5);
+      await runSendLoop(
+        {
+          broadcastId,
+          template,
+          variables,
+          headerImageUrl: broadcast.header_image_url,
+        },
+        supabase,
+        setProgress,
+      );
+
+      setProgress(100);
+      return broadcastId;
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  return { createAndSendBroadcast, sendPreparedBroadcast, isProcessing, progress };
 }

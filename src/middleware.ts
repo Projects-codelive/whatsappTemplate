@@ -44,11 +44,13 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(url)
   }
 
-  // API routes that need auth (not webhooks)
+  // API routes that need auth (not webhooks, and not the scheduled-
+  // send cron which is authenticated by x-cron-secret / AUTOMATION_CRON_SECRET)
   const apiNeedsAuth =
     request.nextUrl.pathname.startsWith('/api/notifications/') ||
     (request.nextUrl.pathname.startsWith('/api/whatsapp/') &&
-      !request.nextUrl.pathname.includes('/webhook'))
+      !request.nextUrl.pathname.includes('/webhook') &&
+      !request.nextUrl.pathname.startsWith('/api/whatsapp/broadcast/cron'))
   if (!user && apiNeedsAuth) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }

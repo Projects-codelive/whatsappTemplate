@@ -35,8 +35,9 @@
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run",
-    "test:watch": "vitest"
+"test": "vitest run",
+      "test:watch": "vitest",
+      "cron:pinger": "node --env-file=.env.local scripts/schedule-pinger.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",

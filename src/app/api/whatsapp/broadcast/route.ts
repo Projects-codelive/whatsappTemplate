@@ -1,33 +1,20 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
-import type { TemplateVariableValue } from '@/lib/whatsapp/template-variables'
-import type { MessageTemplateHeaderType } from '@/types'
+import { sendBroadcastBatch } from '@/lib/broadcasts/send-batch'
+import type { BatchRecipient } from '@/lib/broadcasts/send-batch'
 import { decrypt } from '@/lib/whatsapp/encryption'
-import {
-  sanitizePhoneForMeta,
-  isValidE164,
-  phoneVariants,
-  isRecipientNotAllowedError,
-} from '@/lib/whatsapp/phone-utils'
-import {
-  checkRateLimit,
-  rateLimitResponse,
-  RATE_LIMITS,
-} from '@/lib/rate-limit'
-
-interface BroadcastResult {
-  phone: string
-  status: 'sent' | 'failed'
-  whatsapp_message_id?: string
-  error?: string
-}
+import type { MessageTemplateHeaderType } from '@/types'
 
 /**
+ * POST /api/whatsapp/broadcast — dispatch one batch of template
+ * messages. The composer hook calls this once per 10-recipient batch;
+ * the scheduled-send cron calls the shared sender directly.
+ *
  * Two input shapes are accepted:
  *
  *   NEW (preferred — supports per-recipient variable substitution):
  *     {
+ *       broadcast_id?: string,          // optional status guard
  *       recipients: Array<{ phone: string; params: Array<{key,value}> | string[] }>,
  *       template_name, template_language
  *     }
@@ -40,20 +27,23 @@ interface BroadcastResult {
  *       template_name, template_language
  *     }
  *
- * Previous implementation only supported the legacy shape, and the
- * sending hook was forced to ship every batch with `templateParams[0]`
- * — meaning every recipient got contact-0's personalization. The new
- * shape is what actually fixes that.
- *
  * `recipients[].params` may be either the legacy positional `string[]`
  * (bare `{type:"text", text}` Meta parameters) or the structured
  * `Array<{key,value}>` form, where a non-numeric `key` makes
  * `sendTemplateMessage` emit `parameter_name` — the field Meta requires
  * for named-format templates.
+ *
+ * Rate limiting note: this endpoint is driven once per 10-recipient
+ * batch by the composer, so a per-user fixed window here would throttle
+ * real campaigns (old bug: campaigns > ~50 recipients hit the old
+ * 5/min `broadcast:` bucket and had whole batches marked failed). The
+ * launch-a-campaign budget now lives on the campaign-action endpoints
+ * (/api/whatsapp/broadcast/[id]) where it matches the original intent —
+ * one check per campaign start, not per batch.
  */
 interface NewRecipient {
   phone: string
-  params?: TemplateVariableValue[] | string[]
+  params?: unknown
 }
 
 export async function POST(request: Request) {
@@ -69,16 +59,9 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Per-user broadcast budget. Note: this limits how often a user
-    // can *start* a campaign, not how many messages go out inside
-    // one — the fan-out loop below runs without additional gating.
-    const limit = checkRateLimit(`broadcast:${user.id}`, RATE_LIMITS.broadcast)
-    if (!limit.success) {
-      return rateLimitResponse(limit)
-    }
-
     const body = await request.json()
     const {
+      broadcast_id,
       recipients: newRecipients,
       phone_numbers,
       template_name,
@@ -87,10 +70,44 @@ export async function POST(request: Request) {
       header_image_url,
     } = body
 
+    // Optional campaign-level guard: batches must not dispatch for a
+    // broadcast that has been paused or cancelled since the sender's
+    // last status read. The sender also re-checks between batches; this
+    // closes the race at the API boundary.
+    if (broadcast_id) {
+      const { data: guard } = await supabase
+        .from('broadcasts')
+        .select('status')
+        .eq('id', broadcast_id)
+        .eq('user_id', user.id)
+        .maybeSingle()
+
+      if (!guard) {
+        return NextResponse.json(
+          { error: 'Broadcast not found' },
+          { status: 404 },
+        )
+      }
+      if (guard.status !== 'sending') {
+        return NextResponse.json(
+          {
+            error:
+              guard.status === 'paused'
+                ? 'Broadcast is paused. Resume it before sending more recipients.'
+                : 'Broadcast is no longer sending.',
+          },
+          { status: 409 },
+        )
+      }
+    }
+
     // Normalize to a list of {phone, params} regardless of shape.
-    let recipients: NewRecipient[]
+    let recipients: BatchRecipient[]
     if (Array.isArray(newRecipients) && newRecipients.length > 0) {
-      recipients = newRecipients
+      recipients = (newRecipients as NewRecipient[]).map((r) => ({
+        phone: r.phone,
+        params: r.params as BatchRecipient['params'],
+      }))
     } else if (Array.isArray(phone_numbers) && phone_numbers.length > 0) {
       const shared: string[] = Array.isArray(template_params)
         ? template_params
@@ -176,83 +193,22 @@ export async function POST(request: Request) {
 
     const accessToken = decrypt(config.access_token)
 
-    const results: BroadcastResult[] = []
-    let sentCount = 0
-    let failedCount = 0
-
-    for (const recipient of recipients) {
-      const sanitized = sanitizePhoneForMeta(recipient.phone)
-
-      if (!isValidE164(sanitized)) {
-        results.push({
-          phone: recipient.phone,
-          status: 'failed',
-          error: 'Invalid phone number format',
-        })
-        failedCount++
-        continue
-      }
-
-      // Retry with phone variants on "not in allowed list" so numbers
-      // that differ only in a trunk-prefix 0 still reach recipients.
-      const variants = phoneVariants(sanitized)
-      let sentMessageId: string | null = null
-      let lastError: string | null = null
-
-      for (const variant of variants) {
-        try {
-          const result = await sendTemplateMessage({
-            phoneNumberId: config.phone_number_id,
-            accessToken,
-            to: variant,
-            templateName: template_name,
-            language: template_language || 'en_US',
-            params: recipient.params ?? [],
-            headerImageUrl: header_image_url || undefined,
-            templateHeaderType,
-          })
-          sentMessageId = result.messageId
-          lastError = null
-          break
-        } catch (error) {
-          const errorMessage =
-            error instanceof Error ? error.message : 'Unknown error'
-          if (!isRecipientNotAllowedError(errorMessage)) {
-            lastError = errorMessage
-            break
-          }
-          lastError = errorMessage
-          // retry with next variant
-        }
-      }
-
-      if (sentMessageId) {
-        results.push({
-          phone: recipient.phone,
-          status: 'sent',
-          whatsapp_message_id: sentMessageId,
-        })
-        sentCount++
-      } else {
-        console.error(
-          `Failed to send broadcast to ${recipient.phone}:`,
-          lastError
-        )
-        results.push({
-          phone: recipient.phone,
-          status: 'failed',
-          error: lastError || 'Unknown error',
-        })
-        failedCount++
-      }
-    }
+    const result = await sendBroadcastBatch({
+      recipients,
+      templateName: template_name,
+      templateLanguage: template_language ?? 'en_US',
+      templateHeaderType,
+      headerImageUrl: header_image_url || undefined,
+      accessToken,
+      phoneNumberId: config.phone_number_id,
+    })
 
     return NextResponse.json({
       success: true,
-      total: recipients.length,
-      sent: sentCount,
-      failed: failedCount,
-      results,
+      total: result.total,
+      sent: result.sent,
+      failed: result.failed,
+      results: result.results,
     })
   } catch (error) {
     console.error('Error in WhatsApp broadcast POST:', error)

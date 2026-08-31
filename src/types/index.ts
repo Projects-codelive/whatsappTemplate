@@ -203,7 +203,14 @@ export interface Deal {
   assignee?: Profile;
 }
 
-export type BroadcastStatus = 'draft' | 'scheduled' | 'sending' | 'sent' | 'failed';
+export type BroadcastStatus =
+  | 'draft'
+  | 'scheduled'
+  | 'sending'
+  | 'sent'
+  | 'failed'
+  | 'paused'
+  | 'cancelled';
 export type RecipientStatus = 'pending' | 'sent' | 'delivered' | 'read' | 'replied' | 'failed';
 
 export interface Broadcast {
@@ -216,6 +223,24 @@ export interface Broadcast {
   audience_filter?: Record<string, unknown>;
   scheduled_at?: string;
   status: BroadcastStatus;
+  /**
+   * Public header-image URL for IMAGE-header templates. Persisted from
+   * Phase 3 so scheduled (server-dispatched) sends can reconstruct the
+   * Meta payload without a composer in the loop.
+   */
+  header_image_url?: string;
+  /**
+   * Who drives the sender: 'browser' (composer hook / resume clicks) or
+   * 'cron' (scheduled-send sweep). Ownership prevents the cron sweep
+   * from double-sending recipients alongside an in-page browser loop.
+   */
+  dispatch_mode?: 'browser' | 'cron';
+  /**
+   * Set on the NEW broadcast created by "Resend to Non-Responders",
+   * pointing at the broadcast it was based on. The partial unique index
+   * (migration 017) allows at most one resend per source broadcast.
+   */
+  parent_broadcast_id?: string | null;
   total_recipients: number;
   sent_count: number;
   delivered_count: number;
