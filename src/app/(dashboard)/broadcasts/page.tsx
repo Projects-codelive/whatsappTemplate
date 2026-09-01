@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useState, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { Broadcast, BroadcastStatus } from '@/types';
@@ -47,6 +47,7 @@ import {
 } from 'lucide-react';
 import { getBroadcastStatus, broadcastStatusConfig } from '@/lib/broadcast-status';
 import { useBroadcastSending } from '@/hooks/use-broadcast-sending';
+import { useBroadcastRealtime } from '@/hooks/use-broadcast-realtime';
 
 const BROADCAST_STATUSES: BroadcastStatus[] = [
   'draft',
@@ -155,6 +156,36 @@ export default function BroadcastsPage() {
     fetchBroadcasts();
   }, []);
 
+  const anySending = useMemo(
+    () => broadcasts.some((b) => b.status === 'sending'),
+    [broadcasts],
+  );
+
+  const anyActive = useMemo(
+    () =>
+      broadcasts.some(
+        (b) =>
+          b.status === 'scheduled' ||
+          b.status === 'sending' ||
+          b.status === 'paused',
+      ),
+    [broadcasts],
+  );
+
+  const fetchBroadcastsRef = useRef(fetchBroadcasts);
+  fetchBroadcastsRef.current = fetchBroadcasts;
+
+  // Realtime: subscribe to broadcasts changes for the current user.
+  // Any INSERT/UPDATE/DELETE triggers an immediate refetch instead of
+  // waiting for the polling interval.
+  useBroadcastRealtime({
+    subscribeToBroadcast: true,
+    onBroadcastEvent: useCallback(() => {
+      fetchBroadcastsRef.current();
+    }, []),
+    enabled: anyActive,
+  });
+
   const filteredBroadcasts = useMemo(() => {
     let result = broadcasts;
     if (statusFilter !== 'all') {
@@ -170,26 +201,6 @@ export default function BroadcastsPage() {
     }
     return result;
   }, [broadcasts, search, statusFilter]);
-
-  const anySending = useMemo(
-    () => broadcasts.some((b) => b.status === 'sending'),
-    [broadcasts],
-  );
-
-  // Poll while anything is still moving: a scheduled broadcast flips to
-  // `sending` server-side via the cron, and `paused` may be resumed from
-  // the detail view — the list should stay fresh until everything lands
-  // in a terminal state.
-  const anyActive = useMemo(
-    () =>
-      broadcasts.some(
-        (b) =>
-          b.status === 'scheduled' ||
-          b.status === 'sending' ||
-          b.status === 'paused',
-      ),
-    [broadcasts],
-  );
 
   const allVisibleSelected =
     filteredBroadcasts.length > 0 &&

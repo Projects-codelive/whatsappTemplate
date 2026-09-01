@@ -51,6 +51,7 @@ import {
   getRecipientStatus,
 } from '@/lib/broadcast-status';
 import { useBroadcastSending } from '@/hooks/use-broadcast-sending';
+import { useBroadcastRealtime } from '@/hooks/use-broadcast-realtime';
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -219,6 +220,21 @@ export default function BroadcastDetailPage() {
     broadcast?.status === 'scheduled' ||
     broadcast?.status === 'sending' ||
     broadcast?.status === 'paused';
+
+  // Realtime: subscribe to broadcast + recipient changes for this
+  // broadcast. Any INSERT/UPDATE/DELETE triggers an immediate refetch
+  // instead of waiting for the polling interval.
+  useBroadcastRealtime({
+    broadcastId,
+    subscribeToBroadcast: true,
+    onBroadcastEvent: useCallback(() => {
+      fetchData();
+    }, [fetchData]),
+    onRecipientEvent: useCallback(() => {
+      fetchData();
+    }, [fetchData]),
+    enabled: isActiveStatus,
+  });
 
   useEffect(() => {
     if (!isActiveStatus) {

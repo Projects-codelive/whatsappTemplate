@@ -43,8 +43,8 @@ import type { Contact } from '@/types'
  * large audience = budget × pinger interval.
  */
 
-const ACTIVATE_LIMIT = 10;
-const SWEEP_LIMIT = 10;
+const ACTIVATE_LIMIT = 50;
+const SWEEP_LIMIT = 50;
 const RECIPIENT_BUDGET = 250;
 const CHUNK_SIZE = 10;
 const CHUNK_DELAY_MS = 500;
